@@ -27,6 +27,8 @@ Complete automated deployment of OpenVPN Access Server with virtual host configu
 ### Manual Deployment
 ```bash
 # Clone and setup
+cd $HOME
+sudo apt install git -y
 git clone https://github.com/yasirkareem88/Edge_opas.git
 cd edge_opas
 
