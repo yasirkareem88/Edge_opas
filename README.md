@@ -27,8 +27,8 @@ Complete automated deployment of OpenVPN Access Server with virtual host configu
 ### Manual Deployment
 ```bash
 # Clone and setup
-git clone <your-repo>
-cd <your-repo>
+git clone edge_opas
+cd edge_opas
 
 # Run deployment
 chmod +x scripts/deploy-with-virtualhost.sh
