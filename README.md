@@ -32,4 +32,4 @@ cd edge_opas
 
 # Run deployment
 chmod +x edge_opas.sh
-sudo ./openvpn-as-install.sh
+sudo ./edge_opas.sh
