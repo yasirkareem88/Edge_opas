@@ -31,5 +31,5 @@ git clone edge_opas
 cd edge_opas
 
 # Run deployment
-chmod +x scripts/deploy-with-virtualhost.sh
-./scripts/deploy-with-virtualhost.sh domain.com admin_password
+chmod +x edge_opas.sh
+sudo ./openvpn-as-install.sh
