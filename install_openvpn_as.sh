@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# OpenVPN AS Installation Script with Nginx 502 Fix
+# OpenVPN AS Installation Script with Local Domain & Hosts Auto-Configuration
 
 # Colors for output
 RED='\033[0;31m'
@@ -34,7 +34,7 @@ check_root() {
     fi
 }
 
-# Detect OS
+# Detect OS and get system information
 detect_os() {
     log_info "Detecting operating system..."
     
@@ -49,7 +49,18 @@ detect_os() {
         exit 1
     fi
     
+    # Get server IP address
+    SERVER_IP=$(hostname -I | awk '{print $1}')
+    if [ -z "$SERVER_IP" ]; then
+        SERVER_IP="127.0.0.1"
+    fi
+    
+    # Get hostname
+    SERVER_HOSTNAME=$(hostname)
+    
     log_info "Detected: $OS_NAME $OS_VERSION ($OS_CODENAME)"
+    log_info "Server IP: $SERVER_IP"
+    log_info "Server Hostname: $SERVER_HOSTNAME"
     
     if command -v apt-get &> /dev/null; then
         PKG_MGR="deb"
@@ -60,13 +71,69 @@ detect_os() {
     fi
 }
 
-# User input function
+# Generate suggested local domains
+generate_domain_suggestions() {
+    local suggestions=()
+    
+    # Option 1: Use hostname with .local domain
+    suggestions+=("$SERVER_HOSTNAME.local")
+    
+    # Option 2: Use hostname with .test domain
+    suggestions+=("$SERVER_HOSTNAME.test")
+    
+    # Option 3: Use hostname with .lan domain
+    suggestions+=("$SERVER_HOSTNAME.lan")
+    
+    # Option 4: Use vpn prefix with hostname
+    suggestions+=("vpn.$SERVER_HOSTNAME.local")
+    
+    # Option 5: Use openvpn prefix
+    suggestions+=("openvpn.$SERVER_HOSTNAME.local")
+    
+    # Option 6: Simple vpn domain
+    suggestions+=("vpn.local")
+    
+    # Option 7: Simple openvpn domain
+    suggestions+=("openvpn.local")
+    
+    echo "${suggestions[@]}"
+}
+
+# User input function with domain suggestions
 get_user_input() {
     log_info "Please provide the following configuration details:"
+    echo
     
-    read -p "Enter server domain name or IP address: " DOMAIN_NAME
+    # Generate domain suggestions
+    DOMAIN_SUGGESTIONS=($(generate_domain_suggestions))
+    
+    echo "=== LOCAL DOMAIN SUGGESTIONS ==="
+    for i in "${!DOMAIN_SUGGESTIONS[@]}"; do
+        echo "$((i+1)). ${DOMAIN_SUGGESTIONS[$i]}"
+    done
+    echo
+    
+    read -p "Choose a domain (1-${#DOMAIN_SUGGESTIONS[@]}) or enter custom domain: " domain_choice
+    
+    if [[ "$domain_choice" =~ ^[0-9]+$ ]] && [ "$domain_choice" -ge 1 ] && [ "$domain_choice" -le "${#DOMAIN_SUGGESTIONS[@]}" ]; then
+        DOMAIN_NAME="${DOMAIN_SUGGESTIONS[$((domain_choice-1))]}"
+        log_success "Selected domain: $DOMAIN_NAME"
+    else
+        DOMAIN_NAME="$domain_choice"
+        # Validate custom domain
+        if [[ -z "$DOMAIN_NAME" ]]; then
+            DOMAIN_NAME="${DOMAIN_SUGGESTIONS[0]}"
+            log_info "Using default domain: $DOMAIN_NAME"
+        elif [[ ! "$DOMAIN_NAME" =~ ^[a-zA-Z0-9.-]+$ ]]; then
+            log_error "Invalid domain name. Using default."
+            DOMAIN_NAME="${DOMAIN_SUGGESTIONS[0]}"
+        fi
+    fi
+    
+    echo
     read -p "Enter admin username [admin]: " ADMIN_USER
     ADMIN_USER=${ADMIN_USER:-admin}
+    
     read -s -p "Enter admin password (min 4 characters): " ADMIN_PASSWORD
     echo
     read -p "Enter OpenVPN AS port [943]: " OPENVPN_PORT
@@ -75,11 +142,6 @@ get_user_input() {
     NGINX_PORT=${NGINX_PORT:-443}
     
     # Validate inputs
-    if [ -z "$DOMAIN_NAME" ]; then
-        log_error "Domain name or IP address is required"
-        exit 1
-    fi
-    
     if [ -z "$ADMIN_PASSWORD" ]; then
         log_error "Admin password is required"
         exit 1
@@ -89,6 +151,44 @@ get_user_input() {
         log_error "Admin password must be at least 4 characters long"
         exit 1
     fi
+    
+    # Display configuration summary
+    echo
+    log_info "Configuration Summary:"
+    echo "  Domain: $DOMAIN_NAME"
+    echo "  Admin User: $ADMIN_USER"
+    echo "  OpenVPN Port: $OPENVPN_PORT"
+    echo "  Nginx Port: $NGINX_PORT"
+    echo "  Server IP: $SERVER_IP"
+    echo
+}
+
+# Add domain to hosts file
+configure_hosts_file() {
+    log_info "Configuring /etc/hosts file for local domain resolution..."
+    
+    # Backup original hosts file
+    cp /etc/hosts /etc/hosts.backup.$(date +%Y%m%d_%H%M%S)
+    
+    # Remove existing entries for our domain
+    sed -i "/$DOMAIN_NAME/d" /etc/hosts
+    
+    # Add new entry
+    echo "$SERVER_IP    $DOMAIN_NAME" >> /etc/hosts
+    
+    # Also add localhost entry for redundancy
+    if [[ "$SERVER_IP" != "127.0.0.1" ]]; then
+        echo "127.0.0.1    $DOMAIN_NAME" >> /etc/hosts
+    fi
+    
+    # Add IPv6 entry as well
+    echo "::1          $DOMAIN_NAME" >> /etc/hosts
+    
+    log_success "Added $DOMAIN_NAME to /etc/hosts pointing to $SERVER_IP"
+    
+    # Display the added entries
+    log_info "Current hosts entries for $DOMAIN_NAME:"
+    grep "$DOMAIN_NAME" /etc/hosts
 }
 
 # Install dependencies
@@ -107,7 +207,7 @@ install_dependencies() {
 
 # Setup repository for Ubuntu 24.04
 setup_repository() {
-    log_info "Setting up repository..."
+    log_info "Setting up OpenVPN AS repository..."
     
     # Remove any existing repository
     rm -f /etc/apt/sources.list.d/openvpn-as-repo.list
@@ -197,10 +297,10 @@ configure_openvpn_as() {
     # Configure superuser properties
     /usr/local/openvpn_as/scripts/sacli --key "prop_superuser" --value "$ADMIN_USER" ConfigPut >/dev/null 2>&1
     
-    # Set host name - CRITICAL for Nginx proxy
+    # Set host name - CRITICAL for virtual hosts
     /usr/local/openvpn_as/scripts/sacli --key "host.name" --value "$DOMAIN_NAME" ConfigPut >/dev/null 2>&1
     
-    # Configure ports for Nginx reverse proxy - FIX for 502 error
+    # Configure ports for Nginx reverse proxy
     /usr/local/openvpn_as/scripts/sacli --key "cs.https.port" --value "$OPENVPN_PORT" ConfigPut >/dev/null 2>&1
     /usr/local/openvpn_as/scripts/sacli --key "cs.https.ip" --value "127.0.0.1" ConfigPut >/dev/null 2>&1
     
@@ -210,7 +310,6 @@ configure_openvpn_as() {
     
     # Additional configuration for stability
     /usr/local/openvpn_as/scripts/sacli --key "cs.daemon.enable" --value "true" ConfigPut >/dev/null 2>&1
-    /usr/local/openvpn_as/scripts/sacli --key "cs.https.ip" --value "127.0.0.1" ConfigPut >/dev/null 2>&1
     
     # Start services
     /usr/local/openvpn_as/scripts/sacli start >/dev/null 2>&1
@@ -221,12 +320,13 @@ configure_openvpn_as() {
 
 # Generate SSL certificates
 generate_ssl_certificates() {
-    log_info "Generating SSL certificates..."
+    log_info "Generating SSL certificates for $DOMAIN_NAME..."
     
     # Create directory if it doesn't exist
     mkdir -p /etc/ssl/private
     mkdir -p /etc/ssl/certs
     
+    # Generate certificate with the domain name
     openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
         -keyout /etc/ssl/private/ssl-cert-snakeoil.key \
         -out /etc/ssl/certs/ssl-cert-snakeoil.pem \
@@ -236,26 +336,27 @@ generate_ssl_certificates() {
     chmod 600 /etc/ssl/private/ssl-cert-snakeoil.key
     chmod 644 /etc/ssl/certs/ssl-cert-snakeoil.pem
     
-    log_warning "Using self-signed certificates. For production, use Let's Encrypt"
+    log_warning "Using self-signed certificates for $DOMAIN_NAME"
 }
 
-# Configure Nginx with 502 fix
+# Configure Nginx with virtual host
 configure_nginx() {
-    log_info "Configuring Nginx reverse proxy with 502 fix..."
+    log_info "Configuring Nginx virtual host for $DOMAIN_NAME..."
     
     # Stop Nginx first
     systemctl stop nginx
     
-    # Create a robust Nginx configuration
+    # Create Nginx configuration with virtual host
     cat > /etc/nginx/sites-available/openvpn-as << EOF
-# OpenVPN AS Reverse Proxy Configuration
-# Fixed for 502 Bad Gateway errors
+# OpenVPN AS Virtual Host Configuration for $DOMAIN_NAME
+# Auto-generated by installation script
 
 upstream openvpn_backend {
     server 127.0.0.1:$OPENVPN_PORT;
     keepalive 32;
 }
 
+# HTTPS Server for $DOMAIN_NAME
 server {
     listen $NGINX_PORT ssl;
     server_name $DOMAIN_NAME;
@@ -275,7 +376,7 @@ server {
     add_header X-XSS-Protection "1; mode=block";
     add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload";
     
-    # Proxy Settings - FIX for 502 errors
+    # Proxy Settings
     location / {
         proxy_pass https://openvpn_backend;
         proxy_set_header Host \$host;
@@ -290,7 +391,7 @@ server {
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "upgrade";
         
-        # Timeouts - Increased for stability
+        # Timeouts
         proxy_connect_timeout 120s;
         proxy_send_timeout 120s;
         proxy_read_timeout 120s;
@@ -315,7 +416,7 @@ server {
     error_log /var/log/nginx/openvpn-as-error.log;
 }
 
-# HTTP to HTTPS redirect
+# HTTP to HTTPS redirect for $DOMAIN_NAME
 server {
     listen 80;
     server_name $DOMAIN_NAME;
@@ -335,8 +436,6 @@ EOF
         log_success "Nginx configuration test passed"
     else
         log_error "Nginx configuration test failed"
-        log_info "Checking for configuration errors..."
-        nginx -T | grep -A 10 -B 10 error
         exit 1
     fi
     
@@ -344,7 +443,7 @@ EOF
     systemctl enable nginx
     systemctl restart nginx
     
-    log_success "Nginx configured successfully with 502 fixes"
+    log_success "Nginx virtual host configured for $DOMAIN_NAME"
 }
 
 # Configure firewall
@@ -361,57 +460,34 @@ configure_firewall() {
     log_success "Firewall configured"
 }
 
-# Fix common 502 issues
-fix_502_issues() {
-    log_info "Applying fixes for 502 Bad Gateway issues..."
+# Test domain resolution
+test_domain_resolution() {
+    log_info "Testing domain resolution for $DOMAIN_NAME..."
     
-    # 1. Check if OpenVPN AS is listening on the correct port
-    log_info "Checking if OpenVPN AS is listening on port $OPENVPN_PORT..."
-    if netstat -tlnp | grep -q ":$OPENVPN_PORT"; then
-        log_success "OpenVPN AS is listening on port $OPENVPN_PORT"
+    echo
+    echo "=== DOMAIN RESOLUTION TEST ==="
+    
+    # Test using getent
+    if getent hosts "$DOMAIN_NAME" > /dev/null; then
+        log_success "✓ Domain $DOMAIN_NAME resolves correctly"
+        getent hosts "$DOMAIN_NAME"
     else
-        log_error "OpenVPN AS is NOT listening on port $OPENVPN_PORT"
-        log_info "Restarting OpenVPN AS services..."
-        /usr/local/openvpn_as/scripts/sacli stop
-        sleep 5
-        /usr/local/openvpn_as/scripts/sacli start
-        sleep 10
+        log_error "✗ Domain $DOMAIN_NAME does not resolve"
     fi
     
-    # 2. Check if we can connect to OpenVPN AS locally
-    log_info "Testing local connection to OpenVPN AS..."
-    if curl -k -s -f https://127.0.0.1:$OPENVPN_PORT/admin >/dev/null 2>&1; then
-        log_success "Local connection to OpenVPN AS successful"
+    # Test using ping (will only work if domain points to reachable IP)
+    if ping -c 1 -W 1 "$DOMAIN_NAME" &> /dev/null; then
+        log_success "✓ Domain $DOMAIN_NAME is reachable via ping"
     else
-        log_error "Cannot connect to OpenVPN AS locally"
-        log_info "Checking OpenVPN AS status..."
-        /usr/local/openvpn_as/scripts/sacli status
-        log_info "Checking OpenVPN AS logs..."
-        tail -20 /usr/local/openvpn_as/logs/*.log
+        log_warning "⚠ Domain $DOMAIN_NAME is not reachable via ping (may be normal for local domains)"
     fi
     
-    # 3. Check Nginx error logs
-    log_info "Checking Nginx error logs..."
-    if [ -f "/var/log/nginx/openvpn-as-error.log" ]; then
-        log_info "Recent Nginx errors:"
-        tail -10 /var/log/nginx/openvpn-as-error.log
+    # Test using curl locally
+    if curl -k -s -f "https://$DOMAIN_NAME:$NGINX_PORT" > /dev/null; then
+        log_success "✓ Domain $DOMAIN_NAME is accessible via HTTPS"
+    else
+        log_error "✗ Domain $DOMAIN_NAME is not accessible via HTTPS"
     fi
-    
-    # 4. Ensure proper SELinux/AppArmor settings (if applicable)
-    if command -v getenforce &> /dev/null; then
-        if [ "$(getenforce)" = "Enforcing" ]; then
-            log_warning "SELinux is enforcing - this might cause issues"
-            log_info "Consider setting SELinux to permissive or adding policies"
-        fi
-    fi
-    
-    # 5. Add hosts entry if using IP address
-    if [[ $DOMAIN_NAME =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        log_info "Using IP address, adding to hosts file for local resolution"
-        echo "127.0.0.1 $DOMAIN_NAME" >> /etc/hosts
-    fi
-    
-    log_success "502 fixes applied"
 }
 
 # Verify installation
@@ -419,72 +495,34 @@ verify_installation() {
     log_info "Verifying installation..."
     
     echo
-    echo "=== Service Status ==="
+    echo "=== SERVICE STATUS ==="
     /usr/local/openvpn_as/scripts/sacli status
     
     echo
-    echo "=== Network Connections ==="
+    echo "=== NETWORK CONNECTIONS ==="
     netstat -tlnp | grep -E "($OPENVPN_PORT|$NGINX_PORT|943|443)"
     
     echo
-    echo "=== Testing Local Access ==="
-    if curl -k -s -f https://127.0.0.1:$OPENVPN_PORT/admin >/dev/null 2>&1; then
-        log_success "✓ OpenVPN AS is accessible locally on port $OPENVPN_PORT"
+    echo "=== LOCAL ACCESS TESTS ==="
+    if curl -k -s -f "https://127.0.0.1:$OPENVPN_PORT/admin" > /dev/null; then
+        log_success "✓ OpenVPN AS backend accessible locally"
     else
-        log_error "✗ OpenVPN AS is NOT accessible locally on port $OPENVPN_PORT"
+        log_error "✗ OpenVPN AS backend not accessible locally"
     fi
     
-    echo
-    echo "=== Testing Nginx Proxy ==="
-    if curl -k -s -f https://127.0.0.1:$NGINX_PORT/admin >/dev/null 2>&1; then
-        log_success "✓ Nginx proxy is working locally on port $NGINX_PORT"
+    if curl -k -s -f "https://127.0.0.1:$NGINX_PORT/admin" > /dev/null; then
+        log_success "✓ Nginx proxy accessible locally"
     else
-        log_error "✗ Nginx proxy is NOT working locally on port $NGINX_PORT"
+        log_error "✗ Nginx proxy not accessible locally"
     fi
     
-    # Test external access if domain is not localhost
-    if [[ "$DOMAIN_NAME" != "localhost" ]] && [[ ! "$DOMAIN_NAME" =~ ^127\. ]]; then
-        echo
-        echo "=== Testing External Access ==="
-        log_info "Please test externally: https://$DOMAIN_NAME:$NGINX_PORT/admin"
+    echo
+    echo "=== DOMAIN ACCESS TESTS ==="
+    if curl -k -s -f "https://$DOMAIN_NAME:$NGINX_PORT/admin" > /dev/null; then
+        log_success "✓ Domain $DOMAIN_NAME accessible via Nginx"
+    else
+        log_error "✗ Domain $DOMAIN_NAME not accessible via Nginx"
     fi
-    
-    log_success "Verification completed"
-}
-
-# Display troubleshooting tips
-show_troubleshooting() {
-    echo
-    echo "=== TROUBLESHOOTING 502 BAD GATEWAY ==="
-    echo
-    echo "If you're still getting 502 Bad Gateway:"
-    echo
-    echo "1. CHECK OPENVPN AS STATUS:"
-    echo "   /usr/local/openvpn_as/scripts/sacli status"
-    echo
-    echo "2. CHECK OPENVPN AS LOGS:"
-    echo "   tail -f /usr/local/openvpn_as/logs/*.log"
-    echo
-    echo "3. CHECK NGINX LOGS:"
-    echo "   tail -f /var/log/nginx/openvpn-as-error.log"
-    echo
-    echo "4. TEST LOCAL CONNECTION:"
-    echo "   curl -k https://127.0.0.1:$OPENVPN_PORT/admin"
-    echo
-    echo "5. RESTART SERVICES:"
-    echo "   systemctl restart nginx"
-    echo "   /usr/local/openvpn_as/scripts/sacli restart"
-    echo
-    echo "6. CHECK FIREWALL:"
-    echo "   ufw status"
-    echo
-    echo "7. VERIFY PORTS:"
-    echo "   netstat -tlnp | grep -E '($OPENVPN_PORT|$NGINX_PORT)'"
-    echo
-    echo "8. MANUAL CONFIGURATION CHECK:"
-    echo "   /usr/local/openvpn_as/scripts/sacli --key host.name ConfigQuery"
-    echo "   /usr/local/openvpn_as/scripts/sacli --key cs.https.port ConfigQuery"
-    echo
 }
 
 # Display final summary
@@ -492,21 +530,33 @@ show_summary() {
     log_success "OpenVPN Access Server installation completed!"
     echo
     echo "=== INSTALLATION SUMMARY ==="
-    echo "Domain: $DOMAIN_NAME"
+    echo "Local Domain: $DOMAIN_NAME"
+    echo "Server IP: $SERVER_IP"
     echo "Admin Username: $ADMIN_USER"
-    echo "Admin Web Interface: https://$DOMAIN_NAME:$NGINX_PORT/admin"
-    echo "Client Access: https://$DOMAIN_NAME:$NGINX_PORT/"
-    echo "OpenVPN AS Backend Port: $OPENVPN_PORT"
-    echo "Nginx Frontend Port: $NGINX_PORT"
+    echo "Admin Interface: https://$DOMAIN_NAME:$NGINX_PORT/admin"
+    echo "Client Interface: https://$DOMAIN_NAME:$NGINX_PORT/"
     echo
-    echo "=== ACCESS INFORMATION ==="
-    echo "Web Admin: https://$DOMAIN_NAME:$NGINX_PORT/admin"
-    echo "Client Login: https://$DOMAIN_NAME:$NGINX_PORT/"
+    echo "=== HOSTS CONFIGURATION ==="
+    echo "The domain $DOMAIN_NAME has been added to /etc/hosts"
+    echo "pointing to $SERVER_IP"
     echo
-    echo "=== SERVICE COMMANDS ==="
-    echo "Check Status: /usr/local/openvpn_as/scripts/sacli status"
+    echo "=== ACCESS INSTRUCTIONS ==="
+    echo "1. On this server: https://$DOMAIN_NAME:$NGINX_PORT/admin"
+    echo "2. On local network: https://$SERVER_IP:$NGINX_PORT/admin"
+    echo "3. Add $DOMAIN_NAME to hosts file on other machines to access via domain"
+    echo
+    echo "=== QUICK COMMANDS ==="
+    echo "Check status: /usr/local/openvpn_as/scripts/sacli status"
     echo "Restart OpenVPN: /usr/local/openvpn_as/scripts/sacli restart"
     echo "Restart Nginx: systemctl restart nginx"
+    echo "View logs: tail -f /usr/local/openvpn_as/logs/*.log"
+    echo
+    echo "=== FOR OTHER COMPUTERS ==="
+    echo "To access from other computers, add this line to their hosts file:"
+    echo "$SERVER_IP    $DOMAIN_NAME"
+    echo
+    echo "Windows: C:\\Windows\\System32\\drivers\\etc\\hosts"
+    echo "Linux/Mac: /etc/hosts"
     echo
 }
 
@@ -514,13 +564,14 @@ show_summary() {
 main() {
     clear
     echo "=========================================="
-    echo "  OpenVPN AS Installer with 502 Fix"
+    echo "  OpenVPN AS Installer with Local Domain"
     echo "=========================================="
     echo
     
     check_root
     detect_os
     get_user_input
+    configure_hosts_file
     install_dependencies
     generate_ssl_certificates
     install_openvpn_as
@@ -528,10 +579,9 @@ main() {
     configure_openvpn_as
     configure_nginx
     configure_firewall
-    fix_502_issues
+    test_domain_resolution
     verify_installation
     show_summary
-    show_troubleshooting
 }
 
 # Run main function
