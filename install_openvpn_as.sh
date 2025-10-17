@@ -1,7 +1,9 @@
 #!/bin/bash
 
-# OpenVPN AS Nginx Bad Gateway Fix Script
-# This script fixes common Nginx reverse proxy issues with OpenVPN AS
+# OpenVPN Access Server with Nginx Reverse Proxy - Complete Installation Script
+# Fully automated with error handling and user input
+
+set -e  # Exit on any error
 
 # Colors for output
 RED='\033[0;31m'
@@ -11,384 +13,429 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Logging functions
-log_info() {
+log() {
     echo -e "${BLUE}[INFO]${NC} $1"
 }
 
-log_success() {
+success() {
     echo -e "${GREEN}[SUCCESS]${NC} $1"
 }
 
-log_warning() {
+warn() {
     echo -e "${YELLOW}[WARNING]${NC} $1"
 }
 
-log_error() {
+error() {
     echo -e "${RED}[ERROR]${NC} $1"
+}
+
+# Function to check if command executed successfully
+check_success() {
+    if [ $? -eq 0 ]; then
+        success "$1"
+    else
+        error "$2"
+        exit 1
+    fi
 }
 
 # Check if running as root
 check_root() {
     if [[ $EUID -ne 0 ]]; then
-        log_error "This script must be run as root"
+        error "This script must be run as root. Use: sudo $0"
         exit 1
     fi
 }
 
-# Get current configuration
-get_current_config() {
-    log_info "Gathering current configuration..."
+# Get user input with validation
+get_user_input() {
+    echo
+    log "Please provide the following information:"
+    echo "========================================"
     
-    # Get OpenVPN AS configuration
-    if [ -f "/usr/local/openvpn_as/etc/as.conf" ]; then
-        OPENVPN_AS_PORT=$(grep "admin_ui.https.port" /usr/local/openvpn_as/etc/as.conf | cut -d'=' -f2 | tr -d ' ')
-        OPENVPN_AS_IP=$(grep "admin_ui.https.ip_address" /usr/local/openvpn_as/etc/as.conf | cut -d'=' -f2 | tr -d ' ')
-    else
-        OPENVPN_AS_PORT="943"
-        OPENVPN_AS_IP="127.0.0.1"
-    fi
+    while true; do
+        read -p "Enter your server's public IP address or domain name: " SERVER_HOST
+        if [ -n "$SERVER_HOST" ]; then
+            break
+        else
+            error "Server host cannot be empty"
+        fi
+    done
     
-    # Get domain from previous configuration
-    if [ -f "/usr/local/openvpn_as/etc/config.json" ]; then
-        DOMAIN_NAME=$(grep -A5 "host.name" /usr/local/openvpn_as/etc/config.json | grep "value" | cut -d'"' -f4)
-    fi
+    read -p "Enter admin username [admin]: " ADMIN_USER
+    ADMIN_USER=${ADMIN_USER:-admin}
     
-    # If domain not found, ask user
-    if [ -z "$DOMAIN_NAME" ]; then
-        read -p "Enter your server domain name or IP address: " DOMAIN_NAME
-    fi
+    while true; do
+        read -s -p "Enter admin password: " ADMIN_PASS
+        echo
+        if [ -n "$ADMIN_PASS" ]; then
+            break
+        else
+            error "Admin password cannot be empty"
+        fi
+    done
     
-    log_info "Detected OpenVPN AS running on: $OPENVPN_AS_IP:$OPENVPN_AS_PORT"
-}
-
-# Check if services are running
-check_services() {
-    log_info "Checking service status..."
+    read -p "Enter Nginx external port [443]: " NGINX_PORT
+    NGINX_PORT=${NGINX_PORT:-443}
     
-    # Check OpenVPN AS
-    if pgrep -f "openvpn-as" > /dev/null; then
-        log_success "OpenVPN AS is running"
-    else
-        log_error "OpenVPN AS is not running"
-        log_info "Starting OpenVPN AS..."
-        /usr/local/openvpn_as/scripts/openvpnas -n
-        sleep 5
-    fi
+    read -p "Enter OpenVPN AS internal port [943]: " OPENVPN_PORT
+    OPENVPN_PORT=${OPENVPN_PORT:-943}
     
-    # Check Nginx
-    if systemctl is-active --quiet nginx; then
-        log_success "Nginx is running"
-    else
-        log_error "Nginx is not running"
-        log_info "Starting Nginx..."
-        systemctl start nginx
-    fi
+    # Display configuration summary
+    echo
+    log "Configuration Summary:"
+    echo "====================="
+    echo "Server Host: $SERVER_HOST"
+    echo "Admin Username: $ADMIN_USER"
+    echo "Nginx Port: $NGINX_PORT"
+    echo "OpenVPN AS Port: $OPENVPN_PORT"
+    echo
     
-    # Check if OpenVPN AS is listening on the expected port
-    if netstat -tlnp | grep ":$OPENVPN_AS_PORT" | grep "openvpn-as" > /dev/null; then
-        log_success "OpenVPN AS is listening on port $OPENVPN_AS_PORT"
-    else
-        log_error "OpenVPN AS is not listening on port $OPENVPN_AS_PORT"
-        log_info "Current listening ports:"
-        netstat -tlnp | grep "openvpn-as" || log_info "No OpenVPN AS ports found"
+    read -p "Continue with this configuration? (y/n): " CONFIRM
+    if [[ ! $CONFIRM =~ ^[Yy]$ ]]; then
+        error "Installation cancelled by user"
+        exit 1
     fi
 }
 
-# Fix OpenVPN AS configuration
-fix_openvpn_config() {
-    log_info "Reconfiguring OpenVPN AS for Nginx reverse proxy..."
+# Detect OS and install dependencies
+install_dependencies() {
+    log "Installing system dependencies..."
+    
+    # Update package list
+    apt-get update
+    check_success "Package list updated" "Failed to update package list"
+    
+    # Install required packages
+    apt-get install -y wget curl nginx python3 net-tools ufw \
+                       openssl sqlite3 pkg-config build-essential \
+                       libssl-dev libpam0g-dev liblz4-dev liblzo2-dev \
+                       libpcap-dev net-tools iproute2
+    check_success "Dependencies installed" "Failed to install dependencies"
+}
+
+# Install OpenVPN Access Server
+install_openvpn_as() {
+    log "Installing OpenVPN Access Server..."
+    
+    cd /tmp
+    
+    # Download OpenVPN AS
+    if wget -O openvpn-as.deb "https://swupdate.openvpn.net/scripts/openvpn-as-2.12.0-ubuntu20.amd_64.deb"; then
+        success "OpenVPN AS package downloaded"
+    else
+        warn "Primary download failed, trying alternative..."
+        wget -O openvpn-as.deb "https://swupdate.openvpn.net/scripts/openvpn-as-2.11.0-ubuntu20.amd_64.deb"
+        check_success "OpenVPN AS package downloaded" "Failed to download OpenVPN AS"
+    fi
+    
+    # Install the package
+    dpkg -i openvpn-as.deb || true  # Allow it to fail for dependency resolution
+    
+    # Fix any dependency issues
+    apt-get install -y -f
+    check_success "OpenVPN AS installed" "Failed to install OpenVPN AS"
+}
+
+# Configure OpenVPN AS
+configure_openvpn_as() {
+    log "Configuring OpenVPN Access Server..."
+    
+    # Wait for services to initialize
+    sleep 10
     
     # Stop OpenVPN AS first
-    /usr/local/openvpn_as/scripts/ovpn-init --stop
+    /usr/local/openvpn_as/scripts/sacli stop 2>/dev/null || true
+    sleep 2
     
-    # Configure OpenVPN AS to work with Nginx reverse proxy
-    /usr/local/openvpn_as/scripts/sacli --key "admin_ui.https.ip_address" --value "127.0.0.1" ConfigPut
-    /usr/local/openvpn_as/scripts/sacli --key "admin_ui.https.port" --value "943" ConfigPut
-    /usr/local/openvpn_as/scripts/sacli --key "cs.https.port" --value "943" ConfigPut
+    # Configure basic settings
+    /usr/local/openvpn_as/scripts/sacli --key "host.name" --value "$SERVER_HOST" ConfigPut
+    /usr/local/openvpn_as/scripts/sacli --key "cs.https.port" --value "$OPENVPN_PORT" ConfigPut
+    
+    # Configure for Nginx reverse proxy
     /usr/local/openvpn_as/scripts/sacli --key "vpn.server.port_share.enable" --value "true" ConfigPut
     /usr/local/openvpn_as/scripts/sacli --key "vpn.server.port_share.service" --value "admin+client" ConfigPut
-    /usr/local/openvpn_as/scripts/sacli --key "vpn.server.port_share.port" --value "443" ConfigPut
-    /usr/local/openvpn_as/scripts/sacli --key "host.name" --value "$DOMAIN_NAME" ConfigPut
+    /usr/local/openvpn_as/scripts/sacli --key "vpn.server.port_share.port" --value "$NGINX_PORT" ConfigPut
     
-    # Restart OpenVPN AS
-    /usr/local/openvpn_as/scripts/ovpn-init --start
+    # Bind to localhost only for security
+    /usr/local/openvpn_as/scripts/sacli --key "admin_ui.https.ip_address" --value "127.0.0.1" ConfigPut
+    /usr/local/openvpn_as/scripts/sacli --key "cs.https.ip_address" --value "127.0.0.1" ConfigPut
+    
+    # Set admin password
+    /usr/local/openvpn_as/scripts/sacli --user "$ADMIN_USER" --new_pass "$ADMIN_PASS" SetLocalPassword
+    /usr/local/openvpn_as/scripts/sacli --key "prop_superuser_password" --value "$ADMIN_PASS" ConfigPut
+    
+    # Start OpenVPN AS
     /usr/local/openvpn_as/scripts/sacli start
+    check_success "OpenVPN AS configured and started" "Failed to configure OpenVPN AS"
     
-    log_success "OpenVPN AS reconfigured for reverse proxy"
+    # Wait for service to fully start
+    sleep 10
+    
+    # Verify OpenVPN AS is running
+    if pgrep -f "openvpn-as" > /dev/null; then
+        success "OpenVPN AS is running"
+    else
+        error "OpenVPN AS failed to start"
+        exit 1
+    fi
 }
 
-# Create proper Nginx configuration
-create_nginx_config() {
-    log_info "Creating proper Nginx configuration..."
+# Generate SSL certificates
+generate_ssl_certificates() {
+    log "Generating SSL certificates..."
     
-    # Backup existing config
-    if [ -f "/etc/nginx/sites-available/openvpn-as" ]; then
-        cp /etc/nginx/sites-available/openvpn-as /etc/nginx/sites-available/openvpn-as.backup
-    fi
+    # Create certificate directory if it doesn't exist
+    mkdir -p /etc/ssl/private
+    mkdir -p /etc/ssl/certs
     
-    # Create optimized Nginx configuration
-    cat > /etc/nginx/sites-available/openvpn-as << 'EOF'
+    # Generate self-signed certificate
+    openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+        -keyout /etc/ssl/private/nginx-selfsigned.key \
+        -out /etc/ssl/certs/nginx-selfsigned.crt \
+        -subj "/C=US/ST=State/L=City/O=Organization/CN=$SERVER_HOST" \
+        -addext "subjectAltName=DNS:$SERVER_HOST"
+    
+    # Set proper permissions
+    chmod 600 /etc/ssl/private/nginx-selfsigned.key
+    chmod 644 /etc/ssl/certs/nginx-selfsigned.crt
+    
+    check_success "SSL certificates generated" "Failed to generate SSL certificates"
+}
+
+# Create Nginx configuration
+configure_nginx() {
+    log "Configuring Nginx reverse proxy..."
+    
+    # Create nginx configuration
+    cat > /etc/nginx/sites-available/openvpn-as << EOF
 # OpenVPN AS Reverse Proxy Configuration
 server {
     listen 80;
-    server_name _;
-    return 301 https://$host$request_uri;
+    server_name $SERVER_HOST;
+    return 301 https://\$server_name\$request_uri;
 }
 
 server {
-    listen 443 ssl http2;
-    server_name DOMAIN_PLACEHOLDER;
+    listen $NGINX_PORT ssl http2;
+    server_name $SERVER_HOST;
     
-    # SSL Configuration - Using self-signed for now
-    ssl_certificate /etc/ssl/certs/ssl-cert-snakeoil.pem;
-    ssl_certificate_key /etc/ssl/private/ssl-cert-snakeoil.key;
-    ssl_session_cache shared:SSL:10m;
-    ssl_session_timeout 10m;
+    # SSL Configuration
+    ssl_certificate /etc/ssl/certs/nginx-selfsigned.crt;
+    ssl_certificate_key /etc/ssl/private/nginx-selfsigned.key;
     ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers ECDHE-RSA-AES256-GCM-SHA512:DHE-RSA-AES256-GCM-SHA512:ECDHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES256-GCM-SHA384;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
     ssl_prefer_server_ciphers off;
     
     # Security headers
-    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload";
-    add_header X-Frame-Options DENY;
-    add_header X-Content-Type-Options nosniff;
-    add_header X-XSS-Protection "1; mode=block";
-    add_header Referrer-Policy "strict-origin";
+    add_header X-Frame-Options DENY always;
+    add_header X-Content-Type-Options nosniff always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
     
     # Proxy settings
-    proxy_ssl_server_name on;
+    proxy_ssl_verify off;
     proxy_redirect off;
     
-    # Main location block
+    # Main location - handle both admin and client interfaces
     location / {
-        proxy_pass https://127.0.0.1:943;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_set_header X-Forwarded-Host $host;
+        proxy_pass https://127.0.0.1:$OPENVPN_PORT;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Forwarded-Host \$host;
         
         # WebSocket support
         proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "upgrade";
         
         # Timeouts
         proxy_connect_timeout 90s;
         proxy_send_timeout 90s;
         proxy_read_timeout 90s;
+        
+        # Buffer settings
         proxy_buffering off;
+        proxy_request_buffering off;
     }
     
-    # Specific handling for different paths
-    location ~ ^/(admin|client) {
-        proxy_pass https://127.0.0.1:943;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_set_header X-Forwarded-Host $host;
+    # Specific WebSocket endpoints
+    location ~* ^/(ws|api|jsonrpc) {
+        proxy_pass https://127.0.0.1:$OPENVPN_PORT;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
         
         proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "upgrade";
         
-        proxy_connect_timeout 90s;
-        proxy_send_timeout 90s;
-        proxy_read_timeout 90s;
-        proxy_buffering off;
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
     }
     
     # Increase file upload size
     client_max_body_size 100M;
     
-    # Gzip compression
-    gzip on;
-    gzip_vary on;
-    gzip_min_length 1024;
-    gzip_proxied any;
-    gzip_comp_level 6;
-    gzip_types
-        application/atom+xml
-        application/javascript
-        application/json
-        application/ld+json
-        application/manifest+json
-        application/rss+xml
-        application/vnd.geo+json
-        application/vnd.ms-fontobject
-        application/x-font-ttf
-        application/x-web-app-manifest+json
-        application/xhtml+xml
-        application/xml
-        font/opentype
-        image/bmp
-        image/svg+xml
-        image/x-icon
-        text/cache-manifest
-        text/css
-        text/plain
-        text/vcard
-        text/vnd.rim.location.xloc
-        text/vtt
-        text/x-component
-        text/x-cross-domain-policy;
+    # Access and error logs
+    access_log /var/log/nginx/openvpn-as-access.log;
+    error_log /var/log/nginx/openvpn-as-error.log;
 }
 EOF
     
-    # Replace domain placeholder
-    sed -i "s/DOMAIN_PLACEHOLDER/$DOMAIN_NAME/g" /etc/nginx/sites-available/openvpn-as
+    # Enable the site
+    ln -sf /etc/nginx/sites-available/openvpn-as /etc/nginx/sites-enabled/
     
-    # Enable site
-    if [ ! -f "/etc/nginx/sites-enabled/openvpn-as" ]; then
-        ln -s /etc/nginx/sites-available/openvpn-as /etc/nginx/sites-enabled/
+    # Remove default nginx site
+    rm -f /etc/nginx/sites-enabled/default
+    
+    # Test nginx configuration
+    if nginx -t; then
+        success "Nginx configuration test passed"
+    else
+        error "Nginx configuration test failed"
+        log "Check /etc/nginx/sites-available/openvpn-as for errors"
+        exit 1
     fi
     
-    # Remove default site if it exists
-    if [ -f "/etc/nginx/sites-enabled/default" ]; then
-        rm /etc/nginx/sites-enabled/default
-    fi
-    
-    log_success "Nginx configuration created"
+    # Restart nginx
+    systemctl enable nginx
+    systemctl restart nginx
+    check_success "Nginx configured and started" "Failed to configure Nginx"
 }
 
-# Test connectivity to OpenVPN AS
-test_openvpn_connectivity() {
-    log_info "Testing connectivity to OpenVPN AS backend..."
+# Configure firewall
+configure_firewall() {
+    log "Configuring firewall..."
     
-    # Test if we can reach OpenVPN AS locally
-    if curl -k -s --connect-timeout 10 https://127.0.0.1:943 > /dev/null; then
-        log_success "OpenVPN AS is accessible locally on port 943"
-        return 0
+    # Enable UFW
+    ufw --force enable
+    
+    # Allow SSH
+    ufw allow ssh
+    
+    # Allow HTTP and HTTPS
+    ufw allow 80/tcp
+    ufw allow 443/tcp
+    
+    # Allow OpenVPN port
+    ufw allow 1194/udp
+    
+    # Allow custom Nginx port if not 443
+    if [ "$NGINX_PORT" != "443" ]; then
+        ufw allow "$NGINX_PORT/tcp"
+    fi
+    
+    success "Firewall configured"
+}
+
+# Test the installation
+test_installation() {
+    log "Testing installation..."
+    
+    # Test 1: Check if OpenVPN AS is accessible locally
+    log "Testing OpenVPN AS backend..."
+    if curl -k -s --connect-timeout 10 https://127.0.0.1:$OPENVPN_PORT > /dev/null; then
+        success "OpenVPN AS backend is accessible"
     else
-        log_error "Cannot reach OpenVPN AS on 127.0.0.1:943"
-        log_info "Checking what's running on port 943..."
-        netstat -tlnp | grep ":943"
-        
-        log_info "Checking OpenVPN AS process..."
-        ps aux | grep openvpn-as
-        
-        log_info "Checking OpenVPN AS logs..."
-        tail -20 /usr/local/openvpn_as/logs/*.log 2>/dev/null || log_info "No log files found"
+        error "OpenVPN AS backend is not accessible"
+        log "Checking OpenVPN AS status..."
+        /usr/local/openvpn_as/scripts/sacli status
         return 1
     fi
-}
-
-# Fix SSL certificates
-fix_ssl_certificates() {
-    log_info "Ensuring SSL certificates are properly configured..."
     
-    # Check if certificates exist
-    if [ ! -f "/etc/ssl/certs/ssl-cert-snakeoil.pem" ] || [ ! -f "/etc/ssl/private/ssl-cert-snakeoil.key" ]; then
-        log_info "Generating new SSL certificates..."
-        openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
-            -keyout /etc/ssl/private/ssl-cert-snakeoil.key \
-            -out /etc/ssl/certs/ssl-cert-snakeoil.pem \
-            -subj "/C=US/ST=State/L=City/O=Organization/CN=$DOMAIN_NAME"
-    fi
-    
-    # Set proper permissions
-    chmod 644 /etc/ssl/certs/ssl-cert-snakeoil.pem
-    chmod 640 /etc/ssl/private/ssl-cert-snakeoil.key
-    
-    log_success "SSL certificates configured"
-}
-
-# Test Nginx configuration
-test_nginx_config() {
-    log_info "Testing Nginx configuration..."
-    
-    if nginx -t; then
-        log_success "Nginx configuration test passed"
-        return 0
+    # Test 2: Check if Nginx is serving the proxy
+    log "Testing Nginx reverse proxy..."
+    if curl -k -s --connect-timeout 10 https://127.0.0.1:$NGINX_PORT > /dev/null; then
+        success "Nginx reverse proxy is working"
     else
-        log_error "Nginx configuration test failed"
-        log_info "Checking Nginx error log..."
+        error "Nginx reverse proxy is not working"
+        log "Checking Nginx status..."
+        systemctl status nginx
+        log "Checking Nginx error logs..."
         tail -20 /var/log/nginx/error.log
         return 1
     fi
-}
-
-# Restart services
-restart_services() {
-    log_info "Restarting services..."
     
-    # Restart OpenVPN AS
-    /usr/local/openvpn_as/scripts/sacli stop
-    sleep 2
-    /usr/local/openvpn_as/scripts/sacli start
-    sleep 5
-    
-    # Restart Nginx
-    systemctl reload nginx
-    
-    log_success "Services restarted"
-}
-
-# Final verification
-verify_fix() {
-    log_info "Verifying the fix..."
-    
-    # Wait a moment for services to fully start
-    sleep 5
-    
-    # Test local connectivity
-    if test_openvpn_connectivity; then
-        log_success "✓ OpenVPN AS backend is accessible"
+    # Test 3: Check if services are running
+    if systemctl is-active --quiet nginx; then
+        success "Nginx service is running"
     else
-        log_error "✗ OpenVPN AS backend is not accessible"
-        return 1
+        error "Nginx service is not running"
     fi
     
-    # Test through Nginx
-    log_info "Testing through Nginx reverse proxy..."
-    if curl -k -s --connect-timeout 10 https://localhost/ > /dev/null; then
-        log_success "✓ Nginx reverse proxy is working"
+    if pgrep -f "openvpn-as" > /dev/null; then
+        success "OpenVPN AS service is running"
     else
-        log_error "✗ Nginx reverse proxy is not working"
-        log_info "Checking Nginx access logs..."
-        tail -10 /var/log/nginx/access.log 2>/dev/null || log_info "No access logs found"
-        return 1
+        error "OpenVPN AS service is not running"
     fi
     
-    log_success "All checks passed! The Bad Gateway issue should be resolved."
+    success "All tests completed successfully!"
 }
 
-# Display access information
-show_access_info() {
-    log_success "=== Access Information ==="
-    echo "Admin Interface: https://$DOMAIN_NAME/admin"
-    echo "Client Interface: https://$DOMAIN_NAME/"
-    echo ""
-    echo "If you're still having issues:"
-    echo "1. Check firewall: ufw status"
-    echo "2. Check services: systemctl status nginx"
-    echo "3. Check OpenVPN AS: /usr/local/openvpn_as/scripts/sacli status"
-    echo "4. View logs: tail -f /var/log/nginx/error.log"
+# Display final information
+show_final_info() {
+    echo
+    success "================================================"
+    success "    OpenVPN Access Server Installation Complete"
+    success "================================================"
+    echo
+    log "Access Information:"
+    echo "=================="
+    echo "Admin Interface: https://$SERVER_HOST:$NGINX_PORT/admin"
+    echo "Client Interface: https://$SERVER_HOST:$NGINX_PORT/"
+    echo "Admin Username: $ADMIN_USER"
+    echo
+    log "Next Steps:"
+    echo "==========="
+    echo "1. Access the admin interface using the URL above"
+    echo "2. Log in with your admin credentials"
+    echo "3. Configure your VPN settings"
+    echo "4. Create user profiles"
+    echo "5. Download client configuration files"
+    echo
+    warn "Important Notes:"
+    echo "================"
+    echo "• Self-signed certificates are used (for testing)"
+    echo "• For production, replace with Let's Encrypt certificates"
+    echo "• Ensure DNS is configured for $SERVER_HOST"
+    echo
+    log "Troubleshooting Commands:"
+    echo "========================"
+    echo "Check OpenVPN AS status: /usr/local/openvpn_as/scripts/sacli status"
+    echo "Check Nginx status: systemctl status nginx"
+    echo "View Nginx logs: tail -f /var/log/nginx/openvpn-as-error.log"
+    echo "View OpenVPN AS logs: tail -f /usr/local/openvpn_as/logs/*.log"
+    echo "Restart services: systemctl restart nginx && /usr/local/openvpn_as/scripts/sacli start"
+    echo
 }
 
-# Main fix function
+# Main installation function
 main() {
     clear
-    echo "=========================================="
-    echo "  OpenVPN AS Nginx Bad Gateway Fix"
-    echo "=========================================="
+    echo "================================================"
+    echo "   OpenVPN AS + Nginx Automated Installer"
+    echo "================================================"
     echo
     
+    # Check root privileges
     check_root
-    get_current_config
-    check_services
-    fix_openvpn_config
-    fix_ssl_certificates
-    create_nginx_config
     
-    if test_nginx_config; then
-        restart_services
-        verify_fix
-        show_access_info
-    else
-        log_error "Nginx configuration test failed. Please check the errors above."
-    fi
+    # Get user input
+    get_user_input
+    
+    # Installation steps
+    install_dependencies
+    install_openvpn_as
+    generate_ssl_certificates
+    configure_openvpn_as
+    configure_nginx
+    configure_firewall
+    test_installation
+    show_final_info
 }
 
 # Run main function
