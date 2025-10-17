@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# OpenVPN AS Automated Installation Script for Ubuntu 24.04 and newer systems
-# Alternative installation methods for unsupported OS versions
+# Fixed OpenVPN Access Server Installation Script for Ubuntu 24.04
+# Enhanced version that handles repository issues and provides fallbacks
 
 # Colors for output
 RED='\033[0;31m'
@@ -35,7 +35,7 @@ check_root() {
     fi
 }
 
-# Detect OS and package manager
+# Detect OS and handle Ubuntu 24.04 specifically
 detect_os() {
     log_info "Detecting operating system..."
     
@@ -56,57 +56,10 @@ detect_os() {
     if command -v apt-get &> /dev/null; then
         PKG_MGR="deb"
         log_success "Detected Debian/Ubuntu system (apt)"
-    elif command -v yum &> /dev/null; then
-        PKG_MGR="rpm"
-        log_success "Detected RHEL/CentOS system (yum)"
-    elif command -v dnf &> /dev/null; then
-        PKG_MGR="rpm"
-        log_success "Detected RHEL/CentOS/Fedora system (dnf)"
     else
         log_error "Unsupported package manager"
         exit 1
     fi
-}
-
-# Check OS compatibility
-check_os_compatibility() {
-    log_info "Checking OS compatibility..."
-    
-    case $OS in
-        "ubuntu")
-            case $OS_VERSION in
-                "18.04"|"20.04"|"22.04")
-                    log_success "Ubuntu $OS_VERSION is officially supported"
-                    return 0
-                    ;;
-                "24.04")
-                    log_warning "Ubuntu 24.04 is not officially supported by OpenVPN AS yet"
-                    log_info "Will use Ubuntu 22.04 packages as fallback"
-                    return 1
-                    ;;
-                *)
-                    log_warning "Ubuntu $OS_VERSION may not be officially supported"
-                    return 1
-                    ;;
-            esac
-            ;;
-        "debian")
-            case $OS_VERSION in
-                "10"|"11"|"12")
-                    log_success "Debian $OS_VERSION is supported"
-                    return 0
-                    ;;
-                *)
-                    log_warning "Debian $OS_VERSION may not be officially supported"
-                    return 1
-                    ;;
-            esac
-            ;;
-        *)
-            log_warning "$OS_NAME may not be officially supported"
-            return 1
-            ;;
-    esac
 }
 
 # User input function
@@ -144,41 +97,107 @@ install_dependencies() {
                        liblzo2-2 liblz4-1 libpkcs11-helper1 libcap-ng0 \
                        sqlite3 pkg-config build-essential libssl-dev \
                        libpam0g-dev liblz4-dev liblzo2-dev libpcap-dev \
-                       net-tools iproute2
+                       net-tools iproute2 ca-certificates gnupg
     
-    # For Ubuntu 24.04, install compatible SSL libraries
-    if [ "$OS" = "ubuntu" ] && [ "$OS_VERSION" = "24.04" ]; then
-        log_info "Installing compatible SSL libraries for Ubuntu 24.04..."
-        apt-get install -y libssl3 libssl-dev
-    fi
+    log_success "Dependencies installed successfully"
 }
 
-# Method 1: Download from correct URL structure
-download_openvpn_as_correct_url() {
-    log_info "Attempting to download OpenVPN AS with correct URL structure..."
+# Fix for Ubuntu 24.04 - Use Ubuntu 22.04 repositories
+setup_ubuntu_24_repository() {
+    log_info "Setting up repository for Ubuntu 24.04..."
+    
+    # Remove any existing repository
+    rm -f /etc/apt/sources.list.d/openvpn-as-repo.list
+    rm -f /etc/apt/keyrings/as-repository.asc
+    
+    # Download and add the key
+    wget https://packages.openvpn.net/as-repo-public.asc -qO /etc/apt/keyrings/as-repository.asc
+    
+    # For Ubuntu 24.04, use jammy (22.04) repository
+    if [ "$OS" = "ubuntu" ] && [ "$OS_VERSION" = "24.04" ]; then
+        log_info "Using Ubuntu 22.04 (jammy) repository for compatibility"
+        echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/as-repository.asc] http://packages.openvpn.net/as/debian jammy main" > /etc/apt/sources.list.d/openvpn-as-repo.list
+    else
+        echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/as-repository.asc] http://packages.openvpn.net/as/debian $OS_CODENAME main" > /etc/apt/sources.list.d/openvpn-as-repo.list
+    fi
+    
+    apt-get update
+}
+
+# Alternative installation method - direct package download
+download_and_install_direct() {
+    log_info "Attempting direct package download..."
     
     cd /tmp
     rm -f openvpn-as*.deb
     
-    # Try different URL patterns
-    BASE_URL="https://swupdate.openvpn.net/scripts"
+    # Try multiple URL patterns
+    BASE_URL="https://packages.openvpn.net/as"
     
-    # Pattern 1: Latest stable
-    wget -O openvpn-as.deb "$BASE_URL/openvpn-as-latest-ubuntu22.amd_64.deb" || \
-    wget -O openvpn-as.deb "$BASE_URL/openvpn-as-2.12.0-ubuntu22.amd_64.deb" || \
-    wget -O openvpn-as.deb "$BASE_URL/openvpn-as-2.11.0-ubuntu22.amd_64.deb" || \
-    wget -O openvpn-as.deb "$BASE_URL/openvpn-as-2.10.0-ubuntu22.amd_64.deb"
+    # Pattern 1: Latest stable for Ubuntu 22.04
+    wget -O openvpn-as.deb "$BASE_URL/pool/main/o/openvpn-as/openvpn-as_2.12.0-ubuntu22_amd64.deb" ||
+    wget -O openvpn-as.deb "$BASE_URL/pool/main/o/openvpn-as/openvpn-as_2.11.0-ubuntu22_amd64.deb" ||
+    wget -O openvpn-as.deb "$BASE_URL/pool/main/o/openvpn-as/openvpn-as_2.10.0-ubuntu22_amd64.deb"
     
     if [ -f "openvpn-as.deb" ] && [ -s "openvpn-as.deb" ]; then
-        log_success "Downloaded OpenVPN AS package successfully"
+        log_success "Package downloaded successfully"
+        
+        # Install with dependency resolution
+        dpkg -i openvpn-as.deb || {
+            log_info "Resolving dependencies..."
+            apt-get install -y -f
+        }
         return 0
     else
-        log_error "Failed to download from standard URLs"
+        log_error "Failed to download package"
         return 1
     fi
 }
 
-# Method 2: Use Docker alternative
+# Manual installation with dependency override
+manual_install_with_override() {
+    log_info "Attempting manual installation with dependency override..."
+    
+    cd /tmp
+    
+    # Download the package
+    wget -O openvpn-as.deb "https://packages.openvpn.net/as/pool/main/o/openvpn-as/openvpn-as_2.12.0-ubuntu22_amd64.deb"
+    
+    if [ ! -f "openvpn-as.deb" ]; then
+        log_error "Could not download package"
+        return 1
+    fi
+    
+    # Create a temporary directory for package modification
+    mkdir -p /tmp/openvpn-pkg
+    cd /tmp/openvpn-pkg
+    
+    # Extract the package
+    dpkg-deb -x ../openvpn-as.deb .
+    dpkg-deb -e ../openvpn-as.deb DEBIAN
+    
+    # Modify control file to be less strict about dependencies
+    if [ -f DEBIAN/control ]; then
+        sed -i 's/Depends:.*/Depends: libc6, libssl3, liblzo2-2, liblz4-1, libcap-ng0, libpkcs11-helper1, python3, sqlite3/g' DEBIAN/control
+    fi
+    
+    # Repackage
+    dpkg-deb -b . /tmp/openvpn-as-modified.deb
+    
+    # Install the modified package
+    cd /tmp
+    dpkg -i openvpn-as-modified.deb || apt-get install -y -f
+    
+    if systemctl is-active --quiet openvpnas; then
+        log_success "Manual installation successful"
+        return 0
+    else
+        log_error "Manual installation failed"
+        return 1
+    fi
+}
+
+# Docker installation as fallback
 install_openvpn_as_docker() {
     log_info "Setting up OpenVPN AS using Docker..."
     
@@ -189,12 +208,16 @@ install_openvpn_as_docker() {
         usermod -aG docker $SUDO_USER
     fi
     
+    # Stop any existing container
+    docker stop openvpn-as 2>/dev/null || true
+    docker rm openvpn-as 2>/dev/null || true
+    
     # Create Docker compose file
     cat > /tmp/docker-compose.yml << EOF
 version: '3.8'
 services:
   openvpn-as:
-    image: linuxserver/openvpn-as
+    image: linuxserver/openvpn-as:latest
     container_name: openvpn-as
     cap_add:
       - NET_ADMIN
@@ -216,6 +239,7 @@ EOF
     
     if [ $? -eq 0 ]; then
         log_success "OpenVPN AS Docker container started successfully"
+        DOCKER_MODE=1
         return 0
     else
         log_error "Failed to start OpenVPN AS Docker container"
@@ -223,125 +247,45 @@ EOF
     fi
 }
 
-# Method 3: Manual build from source (fallback)
-install_openvpn_as_source() {
-    log_info "Building OpenVPN AS from source..."
-    
-    cd /tmp
-    apt-get install -y build-essential devscripts debhelper dh-systemd \
-                       libssl-dev liblzo2-dev libpam0g-dev libpkcs11-helper-dev \
-                       liblz4-dev libcap-ng-dev python3-dev
-    
-    # Clone OpenVPN AS source (if available)
-    log_info "Attempting to build from source..."
-    
-    # This is a complex build process, so we'll use a simplified approach
-    # Download the Ubuntu 22.04 package and attempt to install with dependency overrides
-    wget -O openvpn-as.deb "http://archive.ubuntu.com/ubuntu/pool/universe/o/openvpn-as/openvpn-as_2.12.0-ubuntu1_amd64.deb" || \
-    wget -O openvpn-as.deb "https://download.openvpn.net/as/openvpn-as-2.12.0-ubuntu22.amd_64.deb"
-    
-    if [ -f "openvpn-as.deb" ]; then
-        # Extract the package
-        dpkg-deb -x openvpn-as.deb /tmp/openvpn-extract
-        dpkg-deb -e openvpn-as.deb /tmp/openvpn-extract/DEBIAN
-        
-        # Modify control file to be less strict about dependencies
-        sed -i 's/Depends:.*/Depends: libc6, libssl3, liblzo2-2, liblz4-1, libcap-ng0, libpkcs11-helper1/g' /tmp/openvpn-extract/DEBIAN/control
-        
-        # Repackage
-        dpkg-deb -b /tmp/openvpn-extract /tmp/openvpn-as-modified.deb
-        
-        # Install
-        dpkg -i /tmp/openvpn-as-modified.deb || apt-get install -y -f
-        return $?
-    else
-        log_error "Could not download source package for building"
-        return 1
-    fi
-}
-
-# Method 4: Use alternative repository
-install_openvpn_as_alternative_repo() {
-    log_info "Trying alternative repository approach..."
-    
-    # For Ubuntu 24.04, use the 22.04 repository
-    if [ "$OS" = "ubuntu" ] && [ "$OS_VERSION" = "24.04" ]; then
-        log_info "Using Ubuntu 22.04 repository for OpenVPN AS..."
-        
-        # Add the repository for Ubuntu 22.04
-        wget -O /etc/apt/trusted.gpg.d/openvpn-as-repo.asc https://as-repository.openvpn.net/as-repo-public.asc
-        echo "deb [arch=amd64] http://as-repository.openvpn.net/as/debian jammy main" > /etc/apt/sources.list.d/openvpn-as.list
-        
-        apt-get update
-        
-        # Download the package directly
-        cd /tmp
-        apt-get download openvpn-as
-        
-        if [ -f openvpn-as*.deb ]; then
-            # Install with dependency resolution
-            dpkg -i openvpn-as*.deb || apt-get install -y -f
-            return $?
-        else
-            log_error "Could not download package from alternative repository"
-            return 1
-        fi
-    fi
-    
-    return 1
-}
-
-# Main installation function with multiple fallbacks
+# Main installation function
 install_openvpn_as() {
     log_info "Installing OpenVPN Access Server..."
     
-    local method_success=0
+    # Method 1: Try standard repository installation
+    log_info "Method 1: Standard repository installation..."
+    setup_ubuntu_24_repository
     
-    # Method 1: Correct URL download
-    log_info "Trying Method 1: Direct download with correct URLs..."
-    if download_openvpn_as_correct_url; then
-        if dpkg -i /tmp/openvpn-as.deb || apt-get install -y -f; then
-            log_success "Method 1 successful!"
-            return 0
-        fi
-    fi
-    
-    # Method 2: Alternative repository
-    log_info "Trying Method 2: Alternative repository..."
-    if install_openvpn_as_alternative_repo; then
-        log_success "Method 2 successful!"
+    if apt-get install -y openvpn-as; then
+        log_success "Repository installation successful"
         return 0
     fi
     
-    # Method 3: Docker installation
-    log_info "Trying Method 3: Docker installation..."
+    # Method 2: Direct package download
+    log_info "Method 2: Direct package download..."
+    if download_and_install_direct; then
+        return 0
+    fi
+    
+    # Method 3: Manual installation with dependency override
+    log_info "Method 3: Manual installation with dependency override..."
+    if manual_install_with_override; then
+        return 0
+    fi
+    
+    # Method 4: Docker installation
+    log_info "Method 4: Docker installation..."
     if install_openvpn_as_docker; then
-        log_success "Method 3 successful! Using Docker-based OpenVPN AS"
-        DOCKER_MODE=1
         return 0
     fi
     
-    # Method 4: Source build
-    log_info "Trying Method 4: Source build..."
-    if install_openvpn_as_source; then
-        log_success "Method 4 successful!"
-        return 0
-    fi
-    
-    # Final fallback: Manual download instructions
-    log_error "All automated installation methods failed"
+    # Final fallback
+    log_error "All installation methods failed"
     log_info ""
-    log_info "Manual installation required:"
+    log_info "Manual installation instructions:"
     log_info "1. Visit: https://openvpn.net/vpn-software-packages/"
-    log_info "2. Download the appropriate package for your system"
-    log_info "3. Install manually with: dpkg -i openvpn-as-*.deb"
-    log_info "4. Run this script again to continue with configuration"
-    log_info ""
-    log_info "For Ubuntu 24.04, you may need to:"
-    log_info "1. Download Ubuntu 22.04 package manually"
-    log_info "2. Install with: dpkg -i --force-all openvpn-as-*.deb"
-    log_info "3. Fix dependencies with: apt-get install -y -f"
-    
+    log_info "2. Download Ubuntu 22.04 package manually"
+    log_info "3. Install with: dpkg -i openvpn-as_2.12.0-ubuntu22_amd64.deb"
+    log_info "4. Fix dependencies: apt-get install -y -f"
     exit 1
 }
 
@@ -368,7 +312,7 @@ configure_openvpn_as() {
     /usr/local/openvpn_as/scripts/sacli --key "vpn.server.port_share.service" --value "web+client" ConfigPut
     /usr/local/openvpn_as/scripts/sacli --key "vpn.server.port_share.port" --value "$NGINX_PORT" ConfigPut
     
-    # Additional configuration for better compatibility
+    # Additional configuration
     /usr/local/openvpn_as/scripts/sacli --key "cs.daemon.enable" --value "true" ConfigPut
     /usr/local/openvpn_as/scripts/sacli --key "cs.https.ip" --value "127.0.0.1" ConfigPut
     
@@ -391,11 +335,7 @@ configure_nginx() {
     fi
     
     # Create Nginx configuration
-    CONFIG_DIR="/etc/nginx/sites-available"
-    ENABLED_DIR="/etc/nginx/sites-enabled"
-    mkdir -p $CONFIG_DIR $ENABLED_DIR
-    
-    cat > $CONFIG_DIR/openvpn-as << EOF
+    cat > /etc/nginx/sites-available/openvpn-as << EOF
 server {
     listen $NGINX_PORT ssl;
     server_name $DOMAIN_NAME;
@@ -436,11 +376,11 @@ server {
 EOF
     
     # Enable site
-    ln -sf $CONFIG_DIR/openvpn-as $ENABLED_DIR/
+    ln -sf /etc/nginx/sites-available/openvpn-as /etc/nginx/sites-enabled/
     
     # Disable default site
-    if [ -f $ENABLED_DIR/default ]; then
-        rm $ENABLED_DIR/default
+    if [ -f /etc/nginx/sites-enabled/default ]; then
+        rm /etc/nginx/sites-enabled/default
     fi
     
     # Test Nginx configuration
@@ -484,6 +424,32 @@ configure_firewall() {
     log_success "Firewall configured"
 }
 
+# Wait for service to be ready
+wait_for_service() {
+    log_info "Waiting for OpenVPN AS service to be ready..."
+    
+    if [ "$DOCKER_MODE" = "1" ]; then
+        log_info "Docker mode - waiting for container to start..."
+        sleep 30
+        return 0
+    fi
+    
+    local counter=12
+    while [ $counter -gt 0 ]; do
+        if /usr/local/openvpn_as/scripts/sacli status 2>&1 | grep -q -i "error:"; then
+            sleep 5
+            counter=$((counter - 1))
+            log_info "Waiting for service... ($counter attempts left)"
+        else
+            log_success "Service is ready"
+            return 0
+        fi
+    done
+    
+    log_warning "Service taking longer than expected to start"
+    log_info "You can check status manually with: /usr/local/openvpn_as/scripts/sacli status"
+}
+
 # Display installation summary
 show_summary() {
     log_success "Installation completed!"
@@ -522,8 +488,8 @@ show_summary() {
 main() {
     clear
     echo "=========================================="
-    echo "  OpenVPN AS Automated Installer"
-    echo "  for Ubuntu 24.04 and Newer Systems"
+    echo "  OpenVPN AS Fixed Installer"
+    echo "  for Ubuntu 24.04 Compatibility"
     echo "=========================================="
     echo
     
@@ -533,7 +499,6 @@ main() {
     # Execute installation steps
     check_root
     detect_os
-    check_os_compatibility
     get_user_input
     install_dependencies
     generate_ssl_certificates
@@ -541,6 +506,7 @@ main() {
     configure_openvpn_as
     configure_nginx
     configure_firewall
+    wait_for_service
     show_summary
 }
 
