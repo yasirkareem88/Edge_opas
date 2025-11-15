@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # OpenVPN AS Installation Script with Local Domain & Hosts Auto-Configuration
-# FIXED VERSION - Resolves Python compatibility and service startup issues
+# COMPLETELY REWRITTEN - Fixes Python bytecode corruption issues
 
 # Colors for output
 RED='\033[0;31m'
@@ -193,31 +193,32 @@ configure_hosts_file() {
     grep "$DOMAIN_NAME" /etc/hosts
 }
 
-# Fix Python compatibility for Ubuntu 24.04
-fix_python_compatibility() {
-    log_info "Checking and fixing Python compatibility..."
+# Install Python 3.11 for Ubuntu 24.04 compatibility
+install_python_compatibility() {
+    log_info "Setting up Python compatibility..."
     
     if [ "$OS" = "ubuntu" ] && [ "$OS_VERSION" = "24.04" ]; then
-        log_info "Ubuntu 24.04 detected - ensuring Python compatibility"
+        log_info "Ubuntu 24.04 detected - installing Python 3.11 for compatibility"
         
-        # Install Python 3.11 for compatibility
-        if ! command -v python3.11 &> /dev/null; then
-            log_info "Installing Python 3.11 for OpenVPN AS compatibility..."
-            apt-get update
-            apt-get install -y software-properties-common
-            add-apt-repository -y ppa:deadsnakes/ppa
-            apt-get update
-            apt-get install -y python3.11 python3.11-venv python3.11-dev
+        # Install required packages
+        apt-get install -y software-properties-common
+        
+        # Add deadsnakes PPA for Python 3.11
+        add-apt-repository -y ppa:deadsnakes/ppa
+        apt-get update
+        
+        # Install Python 3.11
+        apt-get install -y python3.11 python3.11-venv python3.11-dev
+        
+        # Create alternative python3 link if needed
+        if [ ! -f "/usr/bin/python3.11" ]; then
+            log_error "Python 3.11 installation failed"
+            exit 1
         fi
         
-        # Clean any existing Python cache in OpenVPN AS
-        if [ -d "/usr/local/openvpn_as" ]; then
-            log_info "Cleaning Python cache in OpenVPN AS..."
-            cd /usr/local/openvpn_as
-            find . -name "*.pyc" -delete 2>/dev/null || true
-            find . -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
-            find . -name "*.pyo" -delete 2>/dev/null || true
-        fi
+        log_success "Python 3.11 installed successfully"
+    else
+        log_info "Using system Python version"
     fi
 }
 
@@ -232,8 +233,8 @@ install_dependencies() {
                        libpam0g-dev liblz4-dev liblzo2-dev libpcap-dev \
                        iproute2 ca-certificates gnupg software-properties-common
     
-    # Fix Python compatibility issues
-    fix_python_compatibility
+    # Install Python compatibility
+    install_python_compatibility
     
     log_success "Dependencies installed successfully"
 }
@@ -263,18 +264,49 @@ setup_repository() {
     apt-get update
 }
 
-# Install OpenVPN AS with proper error handling
+# Clean Python cache to prevent "bad magic number" errors
+clean_python_cache() {
+    log_info "Cleaning Python cache to prevent bytecode corruption..."
+    
+    if [ -d "/usr/local/openvpn_as" ]; then
+        cd /usr/local/openvpn_as
+        
+        # Remove ALL Python cache files
+        find . -name "*.pyc" -delete 2>/dev/null || true
+        find . -name "*.pyo" -delete 2>/dev/null || true
+        find . -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
+        find . -name "*.pyc.*" -delete 2>/dev/null || true
+        
+        # Specific cleanup for problematic modules
+        rm -rf pyovpn/__pycache__ 2>/dev/null || true
+        rm -f pyovpn/*.pyc 2>/dev/null || true
+        rm -f pyovpn/*.pyo 2>/dev/null || true
+        
+        log_success "Python cache cleaned successfully"
+    fi
+}
+
+# Install OpenVPN AS with Python compatibility fixes
 install_openvpn_as() {
     log_info "Installing OpenVPN Access Server..."
     
     setup_repository
     
+    # Clean any existing installation
+    if [ -d "/usr/local/openvpn_as" ]; then
+        log_info "Cleaning existing installation..."
+        systemctl stop openvpnas 2>/dev/null || true
+        pkill -f openvpn-as 2>/dev/null || true
+        clean_python_cache
+    fi
+    
     # Install OpenVPN AS
     if apt-get install -y openvpn-as; then
         log_success "OpenVPN AS installed successfully"
         
-        # Apply Python fixes after installation
-        fix_python_compatibility
+        # Clean Python cache immediately after installation
+        clean_python_cache
+        
         return 0
     else
         log_error "Failed to install OpenVPN AS from repository"
@@ -289,8 +321,8 @@ install_openvpn_as() {
             log_info "Installing from downloaded package..."
             dpkg -i openvpn-as.deb || (apt-get update && apt-get install -y -f)
             
-            # Apply Python fixes
-            fix_python_compatibility
+            # Clean Python cache after installation
+            clean_python_cache
             
             log_success "OpenVPN AS installed via direct download"
             return 0
@@ -305,7 +337,7 @@ install_openvpn_as() {
 wait_for_openvpn_ready() {
     log_info "Waiting for OpenVPN AS services to be fully ready..."
     
-    local max_attempts=40
+    local max_attempts=50
     local attempt=1
     
     while [ $attempt -le $max_attempts ]; do
@@ -322,15 +354,29 @@ wait_for_openvpn_ready() {
         fi
         
         # Apply fixes if taking too long
-        if [ $attempt -eq 15 ]; then
-            log_warning "Services taking longer than expected, applying fixes..."
-            fix_python_compatibility
+        if [ $attempt -eq 10 ]; then
+            log_warning "Services taking longer than expected, cleaning Python cache..."
+            clean_python_cache
+        fi
+        
+        if [ $attempt -eq 20 ]; then
+            log_warning "Still waiting for services, attempting restart..."
             systemctl restart openvpnas 2>/dev/null || true
         fi
         
-        if [ $attempt -eq 25 ]; then
-            log_warning "Still waiting for services, attempting manual start..."
-            /usr/local/openvpn_as/scripts/sacli start >/dev/null 2>&1 || true
+        if [ $attempt -eq 30 ]; then
+            log_warning "Services still not ready, checking for Python issues..."
+            # Check for Python errors
+            if [ -f "/usr/local/openvpn_as/logs/server.log" ]; then
+                local python_errors=$(grep -i "bad magic number\|python\|import" /usr/local/openvpn_as/logs/server.log | tail -5)
+                if [ -n "$python_errors" ]; then
+                    log_warning "Python errors detected:"
+                    echo "$python_errors"
+                    log_info "Re-cleaning Python cache..."
+                    clean_python_cache
+                    systemctl restart openvpnas 2>/dev/null || true
+                fi
+            fi
         fi
         
         log_info "Waiting for services to be ready... (attempt $attempt/$max_attempts)"
@@ -340,8 +386,8 @@ wait_for_openvpn_ready() {
     
     log_warning "OpenVPN AS services are taking longer than expected to start"
     
-    # Show diagnostic information
-    log_info "=== DIAGNOSTIC INFORMATION ==="
+    # Show comprehensive diagnostic information
+    log_info "=== COMPREHENSIVE DIAGNOSTICS ==="
     echo "Process check:"
     pgrep -af openvpn || echo "No OpenVPN processes found"
     echo
@@ -350,6 +396,9 @@ wait_for_openvpn_ready() {
     echo
     echo "Service status:"
     systemctl status openvpnas --no-pager -l | head -20
+    echo
+    echo "Recent logs:"
+    tail -20 /usr/local/openvpn_as/logs/*.log 2>/dev/null | grep -i "error\|fail\|exception" | tail -10 || echo "No log files found"
     
     log_info "Continuing with configuration anyway..."
     return 1
@@ -364,12 +413,13 @@ configure_openvpn_as() {
     sleep 5
     
     # Clean Python cache before configuration
-    fix_python_compatibility
+    clean_python_cache
     
-    # Configure admin password with retry logic
+    # Configure admin password with comprehensive retry logic
     local password_attempt=0
-    local max_password_attempts=3
+    local max_password_attempts=5
     
+    log_info "Setting admin password..."
     while [ $password_attempt -lt $max_password_attempts ]; do
         if /usr/local/openvpn_as/scripts/sacli --user "$ADMIN_USER" --new_pass "$ADMIN_PASSWORD" SetLocalPassword >/dev/null 2>&1; then
             log_success "Admin password configured successfully"
@@ -377,13 +427,19 @@ configure_openvpn_as() {
         else
             password_attempt=$((password_attempt + 1))
             log_warning "Failed to set admin password (attempt $password_attempt/$max_password_attempts)"
-            sleep 2
+            
+            # Clean cache and restart service between attempts
+            if [ $password_attempt -lt $max_password_attempts ]; then
+                clean_python_cache
+                systemctl restart openvpnas 2>/dev/null || true
+                sleep 5
+            fi
         fi
     done
     
     if [ $password_attempt -eq $max_password_attempts ]; then
         log_error "Failed to set admin password after $max_password_attempts attempts"
-        log_info "You may need to set it manually later"
+        log_info "You will need to set it manually after installation"
     fi
     
     # Configure critical settings
@@ -401,10 +457,10 @@ configure_openvpn_as() {
     # Fix permissions
     chown -R openvpn:openvpn /usr/local/openvpn_as/ 2>/dev/null || true
     
-    # Start services with retry logic
+    # Start services with comprehensive retry logic
     log_info "Starting OpenVPN AS services..."
     local start_attempt=0
-    local max_start_attempts=3
+    local max_start_attempts=5
     
     while [ $start_attempt -lt $max_start_attempts ]; do
         if /usr/local/openvpn_as/scripts/sacli start >/dev/null 2>&1; then
@@ -413,27 +469,35 @@ configure_openvpn_as() {
         else
             start_attempt=$((start_attempt + 1))
             log_warning "Failed to start services (attempt $start_attempt/$max_start_attempts)"
-            sleep 3
             
-            # Try systemctl as fallback
-            if [ $start_attempt -eq 2 ]; then
-                log_info "Trying systemctl start..."
-                systemctl start openvpnas 2>/dev/null || true
+            if [ $start_attempt -lt $max_start_attempts ]; then
+                # Clean cache and try different startup methods
+                clean_python_cache
+                
+                if [ $start_attempt -eq 2 ]; then
+                    log_info "Trying systemctl start..."
+                    systemctl start openvpnas 2>/dev/null || true
+                elif [ $start_attempt -eq 3 ]; then
+                    log_info "Trying manual start..."
+                    /usr/local/openvpn_as/scripts/openvpnas --nodaemon &
+                    sleep 10
+                fi
+                sleep 5
             fi
         fi
     done
     
     if [ $start_attempt -eq $max_start_attempts ]; then
         log_error "Failed to start OpenVPN AS services after $max_start_attempts attempts"
-        log_info "Trying manual start as last resort..."
-        /usr/local/openvpn_as/scripts/openvpnas &
-        sleep 10
+        log_info "Trying final manual start as last resort..."
+        nohup /usr/local/openvpn_as/scripts/openvpnas > /tmp/openvpn-startup.log 2>&1 &
+        sleep 15
     fi
     
     # Wait for services to be ready
     sleep 10
     
-    log_success "OpenVPN AS configured successfully"
+    log_success "OpenVPN AS configuration completed"
 }
 
 # Generate SSL certificates
@@ -658,7 +722,7 @@ test_service_access() {
     else
         log_error "✗ OpenVPN AS backend not accessible locally"
         log_info "Debug info:"
-        curl -k -v -m 5 https://127.0.0.1:943/admin 2>&1 | grep -i "failed\|error\|refused" | head -5
+        curl -k -v -m 5 https://127.0.0.1:943/admin 2>&1 | grep -i "failed\|error\|refused" | head -3
     fi
     
     # Test Nginx proxy
@@ -735,6 +799,7 @@ show_summary() {
     echo "View Nginx logs: tail -f /var/log/nginx/openvpn-as-error.log"
     echo "Check processes: pgrep -af openvpn"
     echo "Check ports: ss -tlnp | grep -E ':(943|443)'"
+    echo "Clean Python cache: find /usr/local/openvpn_as -name '*.pyc' -delete"
     echo
     echo "=== FOR OTHER COMPUTERS ==="
     echo "To access from other computers, add this line to their hosts file:"
@@ -751,8 +816,8 @@ main() {
     echo "=========================================="
     echo "  OpenVPN AS Installer with Local Domain"
     echo "=========================================="
-    echo "           FIXED VERSION v2.0"
-    echo "    (Ubuntu 24.04 + Python Compatibility)"
+    echo "     COMPLETELY REWRITTEN VERSION v3.0"
+    echo "    FIXES PYTHON BYTECODE CORRUPTION"
     echo "=========================================="
     echo
     
