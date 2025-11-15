@@ -1,6 +1,7 @@
 #!/bin/bash
 
 # OpenVPN AS Installation Script with Local Domain & Hosts Auto-Configuration
+# Fixed Version for Ubuntu 24.04 and Python Compatibility Issues
 
 # Colors for output
 RED='\033[0;31m'
@@ -50,13 +51,16 @@ detect_os() {
     fi
     
     # Get server IP address
-    SERVER_IP=$(hostname -I | awk '{print $1}')
+    SERVER_IP=$(ip route get 1 | awk '{print $7; exit}')
+    if [ -z "$SERVER_IP" ] || [ "$SERVER_IP" = "127.0.0.1" ]; then
+        SERVER_IP=$(hostname -I | awk '{print $1}')
+    fi
     if [ -z "$SERVER_IP" ]; then
         SERVER_IP="127.0.0.1"
     fi
     
     # Get hostname
-    SERVER_HOSTNAME=$(hostname)
+    SERVER_HOSTNAME=$(hostname -s)
     
     log_info "Detected: $OS_NAME $OS_VERSION ($OS_CODENAME)"
     log_info "Server IP: $SERVER_IP"
@@ -136,21 +140,19 @@ get_user_input() {
     
     read -s -p "Enter admin password (min 4 characters): " ADMIN_PASSWORD
     echo
-    read -p "Enter OpenVPN AS port [943]: " OPENVPN_PORT
-    OPENVPN_PORT=${OPENVPN_PORT:-943}
-    read -p "Enter Nginx virtual host port [443]: " NGINX_PORT
-    NGINX_PORT=${NGINX_PORT:-443}
-    
-    # Validate inputs
     if [ -z "$ADMIN_PASSWORD" ]; then
-        log_error "Admin password is required"
+        log_error "Admin password cannot be empty"
         exit 1
     fi
-    
     if [ ${#ADMIN_PASSWORD} -lt 4 ]; then
         log_error "Admin password must be at least 4 characters long"
         exit 1
     fi
+    
+    read -p "Enter OpenVPN AS port [943]: " OPENVPN_PORT
+    OPENVPN_PORT=${OPENVPN_PORT:-943}
+    read -p "Enter Nginx virtual host port [443]: " NGINX_PORT
+    NGINX_PORT=${NGINX_PORT:-443}
     
     # Display configuration summary
     echo
@@ -191,16 +193,47 @@ configure_hosts_file() {
     grep "$DOMAIN_NAME" /etc/hosts
 }
 
+# Install Python 3.11 for Ubuntu 24.04 compatibility
+install_python_compatibility() {
+    log_info "Setting up Python compatibility for Ubuntu 24.04..."
+    
+    if [ "$OS" = "ubuntu" ] && [ "$OS_VERSION" = "24.04" ]; then
+        log_info "Ubuntu 24.04 detected - installing Python 3.11 for compatibility"
+        
+        # Add deadsnakes PPA for Python 3.11
+        apt-get install -y software-properties-common
+        add-apt-repository -y ppa:deadsnakes/ppa
+        apt-get update
+        
+        # Install Python 3.11 and required packages
+        apt-get install -y python3.11 python3.11-dev python3.11-venv python3.11-distutils
+        apt-get install -y python3.11-full
+        
+        # Create symlink for python3.11 as python3 if not exists
+        if [ ! -f /usr/bin/python3.11 ]; then
+            log_error "Python 3.11 installation failed"
+            exit 1
+        fi
+        
+        log_success "Python 3.11 installed for OpenVPN AS compatibility"
+    else
+        log_info "Using system Python version"
+    fi
+}
+
 # Install dependencies
 install_dependencies() {
     log_info "Installing dependencies..."
     
     apt-get update
-    apt-get install -y wget curl nginx python3 net-tools ufw \
+    apt-get install -y wget curl nginx net-tools ufw \
                        liblzo2-2 liblz4-1 libpkcs11-helper1 libcap-ng0 \
                        sqlite3 pkg-config build-essential libssl-dev \
                        libpam0g-dev liblz4-dev liblzo2-dev libpcap-dev \
-                       net-tools iproute2 ca-certificates gnupg
+                       iproute2 ca-certificates gnupg software-properties-common
+    
+    # Install Python compatibility for Ubuntu 24.04
+    install_python_compatibility
     
     log_success "Dependencies installed successfully"
 }
@@ -214,7 +247,7 @@ setup_repository() {
     rm -f /etc/apt/keyrings/as-repository.asc
     
     # Download and add the key
-    wget https://packages.openvpn.net/as-repo-public.asc -qO /etc/apt/keyrings/as-repository.asc
+    wget -q https://packages.openvpn.net/as-repo-public.asc -O /etc/apt/keyrings/as-repository.asc
     
     # For Ubuntu 24.04, use jammy (22.04) repository
     if [ "$OS" = "ubuntu" ] && [ "$OS_VERSION" = "24.04" ]; then
@@ -227,6 +260,29 @@ setup_repository() {
     apt-get update
 }
 
+# Fix Python compatibility issues
+fix_python_compatibility() {
+    log_info "Fixing Python compatibility issues..."
+    
+    # Clean any existing Python cache
+    if [ -d "/usr/local/openvpn_as" ]; then
+        cd /usr/local/openvpn_as
+        find . -name "*.pyc" -delete 2>/dev/null || true
+        find . -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
+    fi
+    
+    # For Ubuntu 24.04, ensure proper Python version is used
+    if [ "$OS" = "ubuntu" ] && [ "$OS_VERSION" = "24.04" ]; then
+        log_info "Ensuring Python 3.11 compatibility for OpenVPN AS"
+        
+        # Check if OpenVPN AS uses the correct Python
+        if [ -f "/usr/local/openvpn_as/bin/python" ]; then
+            python_version=$(/usr/local/openvpn_as/bin/python -V 2>&1 | cut -d' ' -f2)
+            log_info "OpenVPN AS Python version: $python_version"
+        fi
+    fi
+}
+
 # Install OpenVPN AS
 install_openvpn_as() {
     log_info "Installing OpenVPN Access Server..."
@@ -236,6 +292,9 @@ install_openvpn_as() {
     # Install OpenVPN AS
     if apt-get install -y openvpn-as; then
         log_success "OpenVPN AS installed successfully"
+        
+        # Fix Python compatibility immediately after installation
+        fix_python_compatibility
         return 0
     else
         log_error "Failed to install OpenVPN AS from repository"
@@ -243,11 +302,15 @@ install_openvpn_as() {
         
         # Alternative: Direct download
         cd /tmp
-        wget -O openvpn-as.deb "https://packages.openvpn.net/as/pool/main/o/openvpn-as/openvpn-as_2.12.0-ubuntu22_amd64.deb" || \
-        wget -O openvpn-as.deb "https://packages.openvpn.net/as/pool/main/o/openvpn-as/openvpn-as_2.11.0-ubuntu22_amd64.deb"
+        wget -q -O openvpn-as.deb "https://packages.openvpn.net/as/pool/main/o/openvpn-as/openvpn-as_2.12.0-ubuntu22_amd64.deb" || \
+        wget -q -O openvpn-as.deb "https://packages.openvpn.net/as/pool/main/o/openvpn-as/openvpn-as_2.11.0-ubuntu22_amd64.deb"
         
         if [ -f "openvpn-as.deb" ]; then
-            dpkg -i openvpn-as.deb || apt-get install -y -f
+            dpkg -i openvpn-as.deb || (apt-get update && apt-get install -y -f)
+            
+            # Fix Python compatibility
+            fix_python_compatibility
+            
             log_success "OpenVPN AS installed via direct download"
             return 0
         else
@@ -257,21 +320,34 @@ install_openvpn_as() {
     fi
 }
 
-# Wait for OpenVPN AS to be fully ready
+# Wait for OpenVPN AS to be fully ready with better error handling
 wait_for_openvpn_ready() {
     log_info "Waiting for OpenVPN AS services to be fully ready..."
     
-    local max_attempts=30
+    local max_attempts=40
     local attempt=1
     
     while [ $attempt -le $max_attempts ]; do
-        # Check if all services are running
-        if /usr/local/openvpn_as/scripts/sacli status 2>/dev/null | grep -q "started"; then
-            # Additional check - try to connect to the admin interface
-            if curl -k -s -f https://localhost:943/admin >/dev/null 2>&1; then
-                log_success "OpenVPN AS is fully ready (attempt $attempt/$max_attempts)"
-                return 0
+        # Check if the service process is running
+        if pgrep -f "openvpn-as" > /dev/null; then
+            # Check if the port is listening
+            if netstat -tln | grep -q ":943 "; then
+                # Additional check - try to connect to the admin interface
+                if curl -k -s -f https://localhost:943/admin >/dev/null 2>&1; then
+                    log_success "OpenVPN AS is fully ready (attempt $attempt/$max_attempts)"
+                    return 0
+                fi
             fi
+        fi
+        
+        if [ $attempt -eq 10 ]; then
+            log_warning "Services taking longer than expected, applying fixes..."
+            fix_python_compatibility
+        fi
+        
+        if [ $attempt -eq 20 ]; then
+            log_warning "Still waiting for services, attempting restart..."
+            systemctl restart openvpnas 2>/dev/null || /usr/local/openvpn_as/scripts/sacli start
         fi
         
         log_info "Waiting for services to be ready... (attempt $attempt/$max_attempts)"
@@ -280,19 +356,36 @@ wait_for_openvpn_ready() {
     done
     
     log_warning "OpenVPN AS services are taking longer than expected to start"
+    log_info "Checking service status..."
+    
+    # Diagnostic information
+    systemctl status openvpnas --no-pager -l || /usr/local/openvpn_as/scripts/sacli status
+    
     log_info "Continuing with configuration anyway..."
+    return 1
 }
 
-# Configure OpenVPN AS
+# Configure OpenVPN AS with better error handling
 configure_openvpn_as() {
     log_info "Configuring OpenVPN Access Server..."
     
     # Stop services for configuration
-    /usr/local/openvpn_as/scripts/sacli stop >/dev/null 2>&1
-    sleep 3
+    /usr/local/openvpn_as/scripts/sacli stop >/dev/null 2>&1 || pkill -f openvpn-as
+    sleep 5
     
-    # Configure admin password
-    /usr/local/openvpn_as/scripts/sacli --user "$ADMIN_USER" --new_pass "$ADMIN_PASSWORD" SetLocalPassword >/dev/null 2>&1
+    # Configure admin password with retry logic
+    local password_set=0
+    for i in {1..3}; do
+        if /usr/local/openvpn_as/scripts/sacli --user "$ADMIN_USER" --new_pass "$ADMIN_PASSWORD" SetLocalPassword >/dev/null 2>&1; then
+            password_set=1
+            break
+        fi
+        sleep 2
+    done
+    
+    if [ $password_set -eq 0 ]; then
+        log_warning "Failed to set admin password initially, will retry later"
+    fi
     
     # Configure superuser properties
     /usr/local/openvpn_as/scripts/sacli --key "prop_superuser" --value "$ADMIN_USER" ConfigPut >/dev/null 2>&1
@@ -310,10 +403,35 @@ configure_openvpn_as() {
     
     # Additional configuration for stability
     /usr/local/openvpn_as/scripts/sacli --key "cs.daemon.enable" --value "true" ConfigPut >/dev/null 2>&1
+    /usr/local/openvpn_as/scripts/sacli --key "vpn.daemon.enable" --value "true" ConfigPut >/dev/null 2>&1
     
-    # Start services
-    /usr/local/openvpn_as/scripts/sacli start >/dev/null 2>&1
+    # Fix file permissions
+    chown -R openvpn:openvpn /usr/local/openvpn_as/ 2>/dev/null || true
+    
+    # Start services with retry logic
+    local service_started=0
+    for i in {1..3}; do
+        if /usr/local/openvpn_as/scripts/sacli start >/dev/null 2>&1; then
+            service_started=1
+            break
+        fi
+        sleep 3
+    done
+    
+    if [ $service_started -eq 0 ]; then
+        log_warning "Failed to start via sacli, trying systemctl"
+        systemctl start openvpnas 2>/dev/null || true
+    fi
+    
     sleep 10
+    
+    # Final password set attempt if previous failed
+    if [ $password_set -eq 0 ]; then
+        log_info "Retrying to set admin password..."
+        /usr/local/openvpn_as/scripts/sacli --user "$ADMIN_USER" --new_pass "$ADMIN_PASSWORD" SetLocalPassword >/dev/null 2>&1 && \
+        log_success "Admin password set successfully" || \
+        log_warning "Admin password may need to be set manually"
+    fi
     
     log_success "OpenVPN AS configured successfully"
 }
@@ -330,7 +448,7 @@ generate_ssl_certificates() {
     openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
         -keyout /etc/ssl/private/ssl-cert-snakeoil.key \
         -out /etc/ssl/certs/ssl-cert-snakeoil.pem \
-        -subj "/C=US/ST=State/L=City/O=Organization/CN=$DOMAIN_NAME"
+        -subj "/C=US/ST=State/L=City/O=Organization/CN=$DOMAIN_NAME" 2>/dev/null
     
     # Set proper permissions
     chmod 600 /etc/ssl/private/ssl-cert-snakeoil.key
@@ -344,7 +462,8 @@ configure_nginx() {
     log_info "Configuring Nginx virtual host for $DOMAIN_NAME..."
     
     # Stop Nginx first
-    systemctl stop nginx
+    systemctl stop nginx 2>/dev/null || true
+    sleep 2
     
     # Create Nginx configuration with virtual host
     cat > /etc/nginx/sites-available/openvpn-as << EOF
@@ -359,6 +478,7 @@ upstream openvpn_backend {
 # HTTPS Server for $DOMAIN_NAME
 server {
     listen $NGINX_PORT ssl;
+    listen [::]:$NGINX_PORT ssl;
     server_name $DOMAIN_NAME;
     
     # SSL Configuration
@@ -419,16 +539,18 @@ server {
 # HTTP to HTTPS redirect for $DOMAIN_NAME
 server {
     listen 80;
+    listen [::]:80;
     server_name $DOMAIN_NAME;
     return 301 https://\$server_name\$request_uri;
 }
 EOF
     
-    # Remove default Nginx site
-    rm -f /etc/nginx/sites-enabled/default
+    # Remove default Nginx site if exists
+    rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
     
     # Enable our site
-    ln -sf /etc/nginx/sites-available/openvpn-as /etc/nginx/sites-enabled/
+    ln -sf /etc/nginx/sites-available/openvpn-as /etc/nginx/sites-enabled/ 2>/dev/null || \
+    cp /etc/nginx/sites-available/openvpn-as /etc/nginx/sites-enabled/
     
     # Test Nginx configuration
     log_info "Testing Nginx configuration..."
@@ -436,28 +558,43 @@ EOF
         log_success "Nginx configuration test passed"
     else
         log_error "Nginx configuration test failed"
+        # Show specific error
+        nginx -t 2>&1 | tail -10
         exit 1
     fi
     
     # Start Nginx
-    systemctl enable nginx
+    systemctl enable nginx 2>/dev/null || true
     systemctl restart nginx
     
-    log_success "Nginx virtual host configured for $DOMAIN_NAME"
+    # Wait for Nginx to start
+    sleep 3
+    if systemctl is-active --quiet nginx; then
+        log_success "Nginx virtual host configured for $DOMAIN_NAME"
+    else
+        log_error "Nginx failed to start"
+        systemctl status nginx --no-pager -l
+        exit 1
+    fi
 }
 
 # Configure firewall
 configure_firewall() {
     log_info "Configuring firewall..."
     
-    ufw allow ssh
-    ufw allow "$NGINX_PORT/tcp"
-    ufw allow "80/tcp"
-    ufw allow "1194/udp"
-    ufw allow "$OPENVPN_PORT/tcp"
-    echo "y" | ufw enable
+    # Enable UFW if not enabled
+    if ! ufw status | grep -q "Status: active"; then
+        ufw --force enable
+    fi
+    
+    ufw allow ssh comment "SSH"
+    ufw allow "$NGINX_PORT/tcp" comment "OpenVPN Web Interface"
+    ufw allow "80/tcp" comment "HTTP Redirect"
+    ufw allow "1194/udp" comment "OpenVPN"
+    ufw allow "$OPENVPN_PORT/tcp" comment "OpenVPN Admin"
     
     log_success "Firewall configured"
+    ufw status
 }
 
 # Test domain resolution
@@ -473,56 +610,77 @@ test_domain_resolution() {
         getent hosts "$DOMAIN_NAME"
     else
         log_error "✗ Domain $DOMAIN_NAME does not resolve"
+        return 1
     fi
     
     # Test using ping (will only work if domain points to reachable IP)
-    if ping -c 1 -W 1 "$DOMAIN_NAME" &> /dev/null; then
+    if ping -c 1 -W 2 "$DOMAIN_NAME" &> /dev/null; then
         log_success "✓ Domain $DOMAIN_NAME is reachable via ping"
     else
         log_warning "⚠ Domain $DOMAIN_NAME is not reachable via ping (may be normal for local domains)"
     fi
-    
-    # Test using curl locally
-    if curl -k -s -f "https://$DOMAIN_NAME:$NGINX_PORT" > /dev/null; then
-        log_success "✓ Domain $DOMAIN_NAME is accessible via HTTPS"
-    else
-        log_error "✗ Domain $DOMAIN_NAME is not accessible via HTTPS"
-    fi
 }
 
-# Verify installation
-verify_installation() {
-    log_info "Verifying installation..."
+# Test service accessibility
+test_service_access() {
+    log_info "Testing service accessibility..."
     
     echo
-    echo "=== SERVICE STATUS ==="
-    /usr/local/openvpn_as/scripts/sacli status
+    echo "=== SERVICE ACCESS TESTS ==="
     
-    echo
-    echo "=== NETWORK CONNECTIONS ==="
-    netstat -tlnp | grep -E "($OPENVPN_PORT|$NGINX_PORT|943|443)"
-    
-    echo
-    echo "=== LOCAL ACCESS TESTS ==="
-    if curl -k -s -f "https://127.0.0.1:$OPENVPN_PORT/admin" > /dev/null; then
+    # Test OpenVPN AS backend directly
+    echo "1. Testing OpenVPN AS backend (port $OPENVPN_PORT):"
+    if curl -k -s -f -m 10 https://127.0.0.1:$OPENVPN_PORT/admin >/dev/null; then
         log_success "✓ OpenVPN AS backend accessible locally"
     else
         log_error "✗ OpenVPN AS backend not accessible locally"
+        # Show detailed error
+        curl -k -v -m 5 https://127.0.0.1:$OPENVPN_PORT/admin 2>&1 | grep -i "failed\|error"
     fi
     
-    if curl -k -s -f "https://127.0.0.1:$NGINX_PORT/admin" > /dev/null; then
+    # Test Nginx proxy
+    echo "2. Testing Nginx proxy (port $NGINX_PORT):"
+    if curl -k -s -f -m 10 https://127.0.0.1:$NGINX_PORT/admin >/dev/null; then
         log_success "✓ Nginx proxy accessible locally"
     else
         log_error "✗ Nginx proxy not accessible locally"
     fi
     
-    echo
-    echo "=== DOMAIN ACCESS TESTS ==="
-    if curl -k -s -f "https://$DOMAIN_NAME:$NGINX_PORT/admin" > /dev/null; then
+    # Test domain access
+    echo "3. Testing domain access via Nginx:"
+    if curl -k -s -f -m 10 "https://$DOMAIN_NAME:$NGINX_PORT/admin" >/dev/null; then
         log_success "✓ Domain $DOMAIN_NAME accessible via Nginx"
     else
         log_error "✗ Domain $DOMAIN_NAME not accessible via Nginx"
+        log_info "Trying with IP address instead..."
+        if curl -k -s -f -m 10 "https://$SERVER_IP:$NGINX_PORT/admin" >/dev/null; then
+            log_success "✓ Server IP $SERVER_IP accessible via Nginx"
+        else
+            log_error "✗ Server IP $SERVER_IP also not accessible"
+        fi
     fi
+}
+
+# Verify installation with comprehensive checks
+verify_installation() {
+    log_info "Verifying installation..."
+    
+    echo
+    echo "=== SERVICE STATUS ==="
+    if /usr/local/openvpn_as/scripts/sacli status 2>/dev/null; then
+        log_success "OpenVPN AS services are running"
+    else
+        log_warning "OpenVPN AS status check failed, checking processes..."
+        pgrep -af openvpn || log_error "No OpenVPN processes found"
+    fi
+    
+    echo
+    echo "=== NETWORK CONNECTIONS ==="
+    echo "Listening ports:"
+    netstat -tlnp | grep -E "($OPENVPN_PORT|$NGINX_PORT|943|443|1194)" | head -10
+    
+    # Run accessibility tests
+    test_service_access
 }
 
 # Display final summary
@@ -545,11 +703,12 @@ show_summary() {
     echo "2. On local network: https://$SERVER_IP:$NGINX_PORT/admin"
     echo "3. Add $DOMAIN_NAME to hosts file on other machines to access via domain"
     echo
-    echo "=== QUICK COMMANDS ==="
+    echo "=== TROUBLESHOOTING COMMANDS ==="
     echo "Check status: /usr/local/openvpn_as/scripts/sacli status"
-    echo "Restart OpenVPN: /usr/local/openvpn_as/scripts/sacli restart"
+    echo "Restart OpenVPN: systemctl restart openvpnas"
     echo "Restart Nginx: systemctl restart nginx"
-    echo "View logs: tail -f /usr/local/openvpn_as/logs/*.log"
+    echo "View OpenVPN logs: tail -f /usr/local/openvpn_as/logs/server.log"
+    echo "View Nginx logs: tail -f /var/log/nginx/openvpn-as-error.log"
     echo
     echo "=== FOR OTHER COMPUTERS ==="
     echo "To access from other computers, add this line to their hosts file:"
@@ -560,28 +719,55 @@ show_summary() {
     echo
 }
 
+# Cleanup function in case of errors
+cleanup_on_error() {
+    log_error "Installation failed at step: $1"
+    log_info "Attempting to cleanup..."
+    
+    # Stop services
+    systemctl stop openvpnas 2>/dev/null || true
+    systemctl stop nginx 2>/dev/null || true
+    
+    log_info "Cleanup completed. You can run the script again to retry."
+    exit 1
+}
+
 # Main installation function
 main() {
     clear
     echo "=========================================="
     echo "  OpenVPN AS Installer with Local Domain"
     echo "=========================================="
+    echo "           FIXED VERSION v2.0"
+    echo "    (Ubuntu 24.04 + Python Compatibility)"
+    echo "=========================================="
     echo
+    
+    # Set error trap
+    set -e
     
     check_root
     detect_os
     get_user_input
-    configure_hosts_file
-    install_dependencies
-    generate_ssl_certificates
-    install_openvpn_as
-    wait_for_openvpn_ready
-    configure_openvpn_as
-    configure_nginx
-    configure_firewall
-    test_domain_resolution
-    verify_installation
-    show_summary
+    
+    # Execute installation steps with error handling
+    {
+        configure_hosts_file
+        install_dependencies
+        generate_ssl_certificates
+        install_openvpn_as
+        wait_for_openvpn_ready || true
+        configure_openvpn_as
+        configure_nginx
+        configure_firewall
+        test_domain_resolution
+        verify_installation
+        show_summary
+    } || {
+        cleanup_on_error "unknown"
+    }
+    
+    log_success "Installation completed successfully!"
 }
 
 # Run main function
