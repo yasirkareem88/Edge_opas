@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # OpenVPN AS Installation Script for Ubuntu 24.04
-# Compatible with Ubuntu 24.04.02 LTS
+# Fixed dependency issues for Ubuntu 24.04.02 LTS
 
 set -e  # Exit on any error
 
@@ -209,55 +209,91 @@ configure_hosts_file() {
     log_success "Added $DOMAIN_NAME to /etc/hosts pointing to $SERVER_IP"
 }
 
-# Install dependencies optimized for Ubuntu 24.04
+# Fix broken packages and dependencies
+fix_broken_packages() {
+    log_info "Checking and fixing broken packages..."
+    
+    # Clean up any partial installations
+    apt-get autoremove -y
+    apt-get autoclean -y
+    
+    # Fix broken packages
+    dpkg --configure -a
+    apt-get install -f -y
+    
+    # Update package list
+    apt-get update
+    
+    log_success "Package system cleaned and fixed"
+}
+
+# Install dependencies optimized for Ubuntu 24.04 without conflicts
 install_dependencies() {
     log_info "Installing dependencies for Ubuntu 24.04..."
+    
+    # First fix any broken packages
+    fix_broken_packages
     
     # Update package list
     if ! apt-get update; then
         log_error "Failed to update package lists"
     fi
     
-    # Install Ubuntu 24.04 specific dependencies
-    local dependencies=(
+    # Install essential packages first (no conflicts)
+    log_info "Installing essential packages..."
+    local essential_deps=(
         wget
         curl
-        nginx
+        gnupg
+        lsb-release
+        software-properties-common
+        apt-transport-https
+        ca-certificates
+        sqlite3
         python3
         python3-pip
         python3-venv
         net-tools
-        ufw
+        iproute2
+        pkg-config
+        build-essential
+    )
+    
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y "${essential_deps[@]}"; then
+        log_error "Failed to install essential dependencies"
+    fi
+    
+    # Install OpenVPN specific dependencies
+    log_info "Installing OpenVPN specific dependencies..."
+    local openvpn_deps=(
         liblzo2-2
         liblz4-1
         libpkcs11-helper1
         libcap-ng0
-        sqlite3
-        pkg-config
-        build-essential
         libssl-dev
         libpam0g-dev
         liblz4-dev
         liblzo2-dev
         libpcap-dev
-        iproute2
-        ca-certificates
-        gnupg
-        lsb-release
-        software-properties-common
-        apt-transport-https
-        systemd
-        iptables
-        netfilter-persistent
     )
     
-    log_info "Installing: ${dependencies[*]}"
-    
-    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y "${dependencies[@]}"; then
-        log_error "Failed to install dependencies"
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y "${openvpn_deps[@]}"; then
+        log_error "Failed to install OpenVPN dependencies"
     fi
     
-    log_success "Dependencies installed successfully"
+    # Install Nginx separately
+    log_info "Installing Nginx..."
+    if ! apt-get install -y nginx; then
+        log_error "Failed to install Nginx"
+    fi
+    
+    # Install UFW separately (avoiding netfilter-persistent conflict)
+    log_info "Installing UFW firewall..."
+    if ! apt-get install -y ufw; then
+        log_warning "UFW installation had issues, but continuing..."
+    fi
+    
+    log_success "All dependencies installed successfully"
 }
 
 # Setup repository optimized for Ubuntu 24.04
@@ -569,9 +605,15 @@ EOF
     fi
 }
 
-# Configure firewall for Ubuntu 24.04
+# Configure firewall for Ubuntu 24.04 without conflicts
 configure_firewall() {
     log_info "Configuring firewall for Ubuntu 24.04..."
+    
+    # Check if UFW is installed, if not install it without netfilter-persistent
+    if ! command -v ufw >/dev/null 2>&1; then
+        log_info "Installing UFW without conflicting dependencies..."
+        apt-get install -y ufw --no-install-recommends
+    fi
     
     # Enable and configure UFW
     ufw --force enable || true
@@ -623,7 +665,7 @@ main() {
     clear
     echo "=================================================="
     echo "   OpenVPN AS Installer for Ubuntu 24.04"
-    echo "          Optimized for 24.04.02 LTS"
+    echo "    Fixed Dependencies for 24.04.02 LTS"
     echo "=================================================="
     echo
     
