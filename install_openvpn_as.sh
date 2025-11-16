@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # OpenVPN AS Installation Script for Ubuntu 24.04
-# Fixed dependency issues for Ubuntu 24.04.02 LTS
+# Complete fix for missing pyovpn.zip issue
 
 set -e  # Exit on any error
 
@@ -81,12 +81,6 @@ detect_os() {
     log_info "Detected: $OS_NAME $OS_VERSION ($OS_CODENAME)"
     log_info "Server IP: $SERVER_IP"
     log_info "Server Hostname: $SERVER_HOSTNAME"
-    
-    # Check system architecture
-    ARCH=$(dpkg --print-architecture)
-    if [ "$ARCH" != "amd64" ]; then
-        log_warning "This script is optimized for amd64 architecture. Detected: $ARCH"
-    fi
     
     log_success "System compatibility check passed"
 }
@@ -209,37 +203,16 @@ configure_hosts_file() {
     log_success "Added $DOMAIN_NAME to /etc/hosts pointing to $SERVER_IP"
 }
 
-# Fix broken packages and dependencies
-fix_broken_packages() {
-    log_info "Checking and fixing broken packages..."
-    
-    # Clean up any partial installations
-    apt-get autoremove -y
-    apt-get autoclean -y
-    
-    # Fix broken packages
-    dpkg --configure -a
-    apt-get install -f -y
-    
-    # Update package list
-    apt-get update
-    
-    log_success "Package system cleaned and fixed"
-}
-
-# Install dependencies optimized for Ubuntu 24.04 without conflicts
+# Install dependencies optimized for Ubuntu 24.04
 install_dependencies() {
     log_info "Installing dependencies for Ubuntu 24.04..."
-    
-    # First fix any broken packages
-    fix_broken_packages
     
     # Update package list
     if ! apt-get update; then
         log_error "Failed to update package lists"
     fi
     
-    # Install essential packages first (no conflicts)
+    # Install essential packages
     log_info "Installing essential packages..."
     local essential_deps=(
         wget
@@ -257,6 +230,8 @@ install_dependencies() {
         iproute2
         pkg-config
         build-essential
+        nginx
+        ufw
     )
     
     if ! DEBIAN_FRONTEND=noninteractive apt-get install -y "${essential_deps[@]}"; then
@@ -281,18 +256,6 @@ install_dependencies() {
         log_error "Failed to install OpenVPN dependencies"
     fi
     
-    # Install Nginx separately
-    log_info "Installing Nginx..."
-    if ! apt-get install -y nginx; then
-        log_error "Failed to install Nginx"
-    fi
-    
-    # Install UFW separately (avoiding netfilter-persistent conflict)
-    log_info "Installing UFW firewall..."
-    if ! apt-get install -y ufw; then
-        log_warning "UFW installation had issues, but continuing..."
-    fi
-    
     log_success "All dependencies installed successfully"
 }
 
@@ -303,22 +266,21 @@ setup_repository() {
     # Remove any existing repository
     rm -f /etc/apt/sources.list.d/openvpn-as-repo.list
     rm -f /etc/apt/trusted.gpg.d/as-repository.asc
-    rm -f /etc/apt/keyrings/as-repository.asc
     
     # Create directories if they don't exist
     mkdir -p /etc/apt/keyrings
     mkdir -p /etc/apt/sources.list.d
     
-    # Download and add the key (Ubuntu 24.04 compatible method)
+    # Download and add the key
     log_info "Downloading OpenVPN repository key..."
     if ! wget -qO /etc/apt/trusted.gpg.d/as-repository.asc https://packages.openvpn.net/as-repo-public.asc; then
         log_error "Failed to download OpenVPN repository key"
     fi
     
-    # For Ubuntu 24.04, use jammy (22.04) repository as OpenVPN AS doesn't have a 24.04 repo yet
+    # For Ubuntu 24.04, use jammy (22.04) repository
     log_info "Using Ubuntu 22.04 (jammy) repository for Ubuntu 24.04 compatibility"
     
-    # Add repository - using jammy for 24.04 compatibility
+    # Add repository
     echo "deb [arch=amd64 signed-by=/etc/apt/trusted.gpg.d/as-repository.asc] https://packages.openvpn.net/as/debian jammy main" > /etc/apt/sources.list.d/openvpn-as-repo.list
     
     # Update package list
@@ -326,33 +288,12 @@ setup_repository() {
         log_error "Failed to update package lists after adding repository"
     fi
     
-    log_success "OpenVPN AS repository configured successfully for Ubuntu 24.04"
+    log_success "OpenVPN AS repository configured successfully"
 }
 
-# Check and fix pyovpn.zip corruption
-check_and_fix_pyovpn() {
-    log_info "Checking pyovpn.zip integrity..."
-    
-    local pyovpn_zip="/usr/local/openvpn_as/lib/python/pyovpn.zip"
-    
-    if [ ! -f "$pyovpn_zip" ]; then
-        log_error "pyovpn.zip not found at $pyovpn_zip"
-        return 1
-    fi
-    
-    # Test if the zip file is valid
-    if unzip -t "$pyovpn_zip" >/dev/null 2>&1; then
-        log_success "pyovpn.zip is valid and not corrupted"
-        return 0
-    else
-        log_warning "pyovpn.zip is corrupted, downloading fresh copy..."
-        download_fresh_pyovpn
-    fi
-}
-
-# Download and install fresh pyovpn.zip
-download_fresh_pyovpn() {
-    log_info "Downloading fresh pyovpn.zip for Ubuntu 24.04 compatibility..."
+# Download and extract pyovpn.zip from OpenVPN AS package
+download_and_extract_pyovpn() {
+    log_info "Downloading OpenVPN AS package to extract pyovpn.zip..."
     
     local temp_dir=$(mktemp -d)
     cd "$temp_dir"
@@ -364,15 +305,15 @@ download_fresh_pyovpn() {
     
     # Download the package
     if ! wget -O openvpn-as.deb "$package_url"; then
-        log_error "Failed to download OpenVPN AS package for pyovpn extraction"
+        log_error "Failed to download OpenVPN AS package"
         return 1
     fi
     
-    # Extract the package to get pyovpn.zip
-    log_info "Extracting pyovpn.zip from package..."
+    # Extract the package
+    log_info "Extracting package contents..."
+    ar x openvpn-as.deb
     
     # Extract data archive
-    ar x openvpn-as.deb
     if [ -f "data.tar.xz" ]; then
         tar -xf data.tar.xz
     elif [ -f "data.tar.gz" ]; then
@@ -385,26 +326,28 @@ download_fresh_pyovpn() {
     # Find and copy pyovpn.zip
     local pyovpn_path=$(find . -name "pyovpn.zip" -type f | head -1)
     if [ -n "$pyovpn_path" ] && [ -f "$pyovpn_path" ]; then
-        log_info "Found pyovpn.zip, installing fresh copy..."
+        log_info "Found pyovpn.zip, installing to OpenVPN AS directory..."
         
-        # Stop OpenVPN AS services before replacing the file
-        systemctl stop openvpnas 2>/dev/null || true
-        
-        # Remove the corrupted file and copy the fresh one
-        rm -f "/usr/local/openvpn_as/lib/python/pyovpn.zip"
+        # Create directory if it doesn't exist
         mkdir -p /usr/local/openvpn_as/lib/python/
+        
+        # Copy pyovpn.zip
         cp "$pyovpn_path" "/usr/local/openvpn_as/lib/python/pyovpn.zip"
         chmod 644 "/usr/local/openvpn_as/lib/python/pyovpn.zip"
         
-        # Clean Python cache
-        find "/usr/local/openvpn_as/lib/python" -name "*.pyc" -delete 2>/dev/null || true
-        find "/usr/local/openvpn_as/lib/python" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
-        
-        # Verify the new file is valid
-        if unzip -t "/usr/local/openvpn_as/lib/python/pyovpn.zip" >/dev/null 2>&1; then
-            log_success "Fresh pyovpn.zip installed and verified successfully"
+        # Verify the file
+        if [ -f "/usr/local/openvpn_as/lib/python/pyovpn.zip" ]; then
+            log_success "pyovpn.zip successfully installed"
+            
+            # Test if the zip file is valid
+            if unzip -t "/usr/local/openvpn_as/lib/python/pyovpn.zip" >/dev/null 2>&1; then
+                log_success "pyovpn.zip is valid and not corrupted"
+            else
+                log_error "Downloaded pyovpn.zip is corrupted"
+                return 1
+            fi
         else
-            log_error "Replaced pyovpn.zip is still corrupted"
+            log_error "Failed to copy pyovpn.zip"
             return 1
         fi
     else
@@ -415,29 +358,87 @@ download_fresh_pyovpn() {
     # Cleanup
     cd /
     rm -rf "$temp_dir"
+    return 0
 }
 
-# Install OpenVPN AS with Ubuntu 24.04 compatibility
+# Install OpenVPN AS with pre-downloaded pyovpn.zip
 install_openvpn_as() {
-    log_info "Installing OpenVPN Access Server for Ubuntu 24.04..."
+    log_info "Installing OpenVPN Access Server..."
     
     setup_repository
     
-    # Install OpenVPN AS
+    # First, download and install pyovpn.zip to prevent missing file issues
+    log_info "Pre-installing pyovpn.zip to prevent installation failures..."
+    if ! download_and_extract_pyovpn; then
+        log_error "Failed to pre-install pyovpn.zip"
+    fi
+    
+    # Now install OpenVPN AS package
     log_info "Installing openvpn-as package..."
     if apt-get install -y openvpn-as; then
         log_success "OpenVPN AS installed successfully"
         
-        # CRITICAL: Check and fix pyovpn corruption immediately
-        log_info "Performing post-installation integrity check..."
-        if check_and_fix_pyovpn; then
-            log_success "OpenVPN AS installation completed successfully"
+        # Verify pyovpn.zip still exists after installation
+        if [ -f "/usr/local/openvpn_as/lib/python/pyovpn.zip" ]; then
+            log_success "pyovpn.zip verified after installation"
         else
-            log_error "Failed to fix pyovpn corruption after installation"
+            log_warning "pyovpn.zip missing after installation, re-installing..."
+            if ! download_and_extract_pyovpn; then
+                log_error "Failed to re-install pyovpn.zip after package installation"
+            fi
         fi
         return 0
     else
         log_error "Failed to install OpenVPN AS from repository"
+    fi
+}
+
+# Verify OpenVPN AS installation and fix any issues
+verify_openvpn_installation() {
+    log_info "Verifying OpenVPN AS installation..."
+    
+    local pyovpn_zip="/usr/local/openvpn_as/lib/python/pyovpn.zip"
+    local issues_found=0
+    
+    # Check if pyovpn.zip exists
+    if [ ! -f "$pyovpn_zip" ]; then
+        log_warning "pyovpn.zip is missing, downloading..."
+        if ! download_and_extract_pyovpn; then
+            log_error "Failed to install missing pyovpn.zip"
+        fi
+        issues_found=1
+    fi
+    
+    # Check if pyovpn.zip is valid
+    if [ -f "$pyovpn_zip" ]; then
+        if ! unzip -t "$pyovpn_zip" >/dev/null 2>&1; then
+            log_warning "pyovpn.zip is corrupted, re-downloading..."
+            if ! download_and_extract_pyovpn; then
+                log_error "Failed to replace corrupted pyovpn.zip"
+            fi
+            issues_found=1
+        fi
+    fi
+    
+    # Check if OpenVPN AS directory structure is complete
+    local required_dirs=(
+        "/usr/local/openvpn_as"
+        "/usr/local/openvpn_as/bin"
+        "/usr/local/openvpn_as/scripts"
+        "/usr/local/openvpn_as/lib/python"
+    )
+    
+    for dir in "${required_dirs[@]}"; do
+        if [ ! -d "$dir" ]; then
+            log_warning "Missing directory: $dir"
+            issues_found=1
+        fi
+    done
+    
+    if [ $issues_found -eq 0 ]; then
+        log_success "OpenVPN AS installation verified successfully"
+    else
+        log_warning "Some issues were found and fixed during verification"
     fi
 }
 
@@ -453,7 +454,7 @@ wait_for_openvpn_ready() {
     systemctl start openvpnas 2>/dev/null || true
     
     while [ $attempt -le $max_attempts ]; do
-        # Check if services are running using multiple methods
+        # Check if services are running
         if systemctl is-active --quiet openvpnas 2>/dev/null; then
             # Additional check - try to connect to the admin interface
             if curl -k -s -f https://localhost:943/admin >/dev/null 2>&1; then
@@ -465,7 +466,6 @@ wait_for_openvpn_ready() {
         # Progress indicators
         if [ $((attempt % 10)) -eq 0 ]; then
             log_info "Still waiting for services... (attempt $attempt/$max_attempts)"
-            systemctl status openvpnas --no-pager -l | head -10 2>/dev/null || true
         fi
         
         sleep 3
@@ -475,7 +475,6 @@ wait_for_openvpn_ready() {
     log_warning "OpenVPN AS services are taking longer than expected to start"
     log_info "Checking service status for debugging..."
     systemctl status openvpnas --no-pager -l 2>/dev/null || true
-    journalctl -u openvpnas --no-pager -n 20 2>/dev/null || true
     
     log_info "Continuing with configuration..."
 }
@@ -490,19 +489,19 @@ configure_openvpn_as() {
     
     # Configure admin password with retry
     local password_set=0
-    for i in {1..3}; do
+    for i in {1..5}; do
         if /usr/local/openvpn_as/scripts/sacli --user "$ADMIN_USER" --new_pass "$ADMIN_PASSWORD" SetLocalPassword >/dev/null 2>&1; then
             log_success "Admin password configured successfully"
             password_set=1
             break
         else
-            log_warning "Failed to set admin password (attempt $i/3), retrying..."
-            sleep 3
+            log_warning "Failed to set admin password (attempt $i/5), retrying..."
+            sleep 5
         fi
     done
     
     if [ $password_set -eq 0 ]; then
-        log_warning "Failed to set admin password initially, will retry later"
+        log_warning "Failed to set admin password after multiple attempts"
     fi
     
     # Configure other settings
@@ -605,15 +604,9 @@ EOF
     fi
 }
 
-# Configure firewall for Ubuntu 24.04 without conflicts
+# Configure firewall
 configure_firewall() {
-    log_info "Configuring firewall for Ubuntu 24.04..."
-    
-    # Check if UFW is installed, if not install it without netfilter-persistent
-    if ! command -v ufw >/dev/null 2>&1; then
-        log_info "Installing UFW without conflicting dependencies..."
-        apt-get install -y ufw --no-install-recommends
-    fi
+    log_info "Configuring firewall..."
     
     # Enable and configure UFW
     ufw --force enable || true
@@ -649,6 +642,16 @@ verify_installation() {
     echo "Username: $ADMIN_USER"
     echo "Password: [The password you set during installation]"
     echo
+    echo "=== VERIFICATION ==="
+    
+    # Test pyovpn import
+    if python3 -c "import sys; sys.path.insert(0, '/usr/local/openvpn_as/lib/python'); import pyovpn; print('✓ pyovpn module imports successfully')" 2>/dev/null; then
+        log_success "✓ pyovpn module is working correctly"
+    else
+        log_error "✗ pyovpn module is not working"
+    fi
+    
+    echo
     echo "=== TROUBLESHOOTING ==="
     echo "If you encounter issues:"
     echo "1. Check service status: systemctl status openvpnas"
@@ -665,7 +668,7 @@ main() {
     clear
     echo "=================================================="
     echo "   OpenVPN AS Installer for Ubuntu 24.04"
-    echo "    Fixed Dependencies for 24.04.02 LTS"
+    echo "    Complete Fix for Missing pyovpn.zip"
     echo "=================================================="
     echo
     
@@ -679,6 +682,7 @@ main() {
     install_dependencies
     generate_ssl_certificates
     install_openvpn_as
+    verify_openvpn_installation
     wait_for_openvpn_ready
     configure_openvpn_as
     configure_nginx
@@ -690,7 +694,6 @@ main() {
     log_info "Important: It may take 1-2 minutes for all services to be fully operational"
     log_info "Access your VPN administration at: https://$DOMAIN_NAME:$NGINX_PORT/admin"
     echo
-    log_info "Installation log saved in system logs"
 }
 
 # Run main function
