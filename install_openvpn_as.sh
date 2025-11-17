@@ -435,7 +435,7 @@ get_user_input() {
     log_info "Configuration Summary:"
     echo "  Domain: $DOMAIN_NAME"
     echo "  Admin User: $ADMIN_USER"
-    echo "  Admin Password: $ADMIN_PASSWORD"  # Display the password
+    echo "  Admin Password: ********"  # Don't show actual password for security
     echo "  SSH Port: $SSH_PORT"
     echo "  HTTP Port: $HTTP_PORT"
     echo "  HTTPS Port: $HTTPS_PORT"
@@ -508,13 +508,31 @@ install_dependencies() {
     log_success "All dependencies installed successfully"
 }
 
+# Clean up any stuck processes
+cleanup_stuck_processes() {
+    log_info "Cleaning up any stuck processes..."
+    
+    # Kill any stuck OpenVPN processes
+    pkill -f "openvpn" || true
+    pkill -f "install.sh" || true
+    pkill -f "ovpn-init" || true
+    sleep 3
+    
+    # Remove lock files
+    rm -f /var/lib/dpkg/lock*
+    rm -f /var/cache/apt/archives/lock*
+    
+    # Fix any broken packages
+    dpkg --configure -a 2>/dev/null || true
+    apt-get install -f -y 2>/dev/null || true
+}
+
 # Install OpenVPN AS with proper timeout and stuck process handling
 install_openvpn_as() {
     log_info "Installing OpenVPN Access Server using official method..."
     
-    # Kill any existing OpenVPN processes
-    pkill -f openvpn || true
-    sleep 2
+    # Clean up first
+    cleanup_stuck_processes
     
     # Download the installer
     local installer_url="https://packages.openvpn.net/as/install.sh"
@@ -524,24 +542,91 @@ install_openvpn_as() {
         chmod +x "$installer_path"
         
         log_info "Starting OpenVPN AS installation (this may take 5-10 minutes)..."
+        log_info "DO NOT INTERRUPT - This will take a while..."
         
-        # Run installer with longer timeout and better process management
-        if timeout 600 bash "$installer_path" --yes; then
+        # Run installer with nohup and proper output handling
+        if timeout 900 bash -c "
+            echo 'Starting installation process...'
+            nohup bash '$installer_path' --yes > /tmp/openvpn-install.log 2>&1 &
+            PID=\$!
+            
+            # Wait for process with progress
+            for i in {1..60}; do
+                if kill -0 \$PID 2>/dev/null; then
+                    echo -n '.'
+                    sleep 10
+                else
+                    wait \$PID
+                    exit \$?
+                fi
+            done
+            
+            echo 'Installation taking longer than expected, but continuing...'
+            wait \$PID
+            exit \$?
+        "; then
             log_success "OpenVPN AS installed successfully using official method"
             rm -f "$installer_path"
         else
-            log_warning "OpenVPN AS installer timed out, checking if installation completed..."
+            log_warning "OpenVPN AS installer timed out or was interrupted"
+            log_info "Checking if installation completed..."
             
             # Check if installation actually completed
             if [ -f "/usr/local/openvpn_as/scripts/sacli" ]; then
-                log_success "OpenVPN AS installed successfully (despite timeout)"
+                log_success "OpenVPN AS core components installed (installation completed)"
                 rm -f "$installer_path"
+                return 0
             else
                 log_error "OpenVPN AS installation failed completely"
+                return 1
             fi
         fi
     else
         log_error "Failed to download OpenVPN AS installer"
+        return 1
+    fi
+}
+
+# Alternative manual installation method
+install_openvpn_as_manual() {
+    log_info "Trying alternative manual installation method..."
+    
+    # Download the specific package for Ubuntu 24.04
+    local arch=$(dpkg --print-architecture)
+    local package_url=""
+    
+    case "$arch" in
+        "amd64")
+            package_url="https://packages.openvpn.net/as/openvpn-as-3.0.1-9c6400cd-Ubuntu24.amd64.deb"
+            ;;
+        "arm64")
+            package_url="https://packages.openvpn.net/as/openvpn-as-3.0.1-9c6400cd-Ubuntu24.arm64.deb"
+            ;;
+        *)
+            log_error "Unsupported architecture: $arch"
+            ;;
+    esac
+    
+    log_info "Downloading OpenVPN AS package for $arch..."
+    local package_path="/tmp/openvpn-as.deb"
+    
+    if wget -q "$package_url" -O "$package_path"; then
+        log_info "Installing OpenVPN AS from downloaded package..."
+        
+        # Install the package
+        if dpkg -i "$package_path"; then
+            # Fix dependencies if needed
+            apt-get install -f -y >/dev/null 2>&1 || true
+            log_success "OpenVPN AS package installed successfully"
+            rm -f "$package_path"
+            return 0
+        else
+            log_error "Failed to install OpenVPN AS package"
+            return 1
+        fi
+    else
+        log_error "Failed to download OpenVPN AS package"
+        return 1
     fi
 }
 
@@ -631,7 +716,7 @@ configure_openvpn_as() {
     if [ $password_set -eq 0 ]; then
         log_warning "Failed to set admin password after multiple attempts"
         log_info "You may need to set it manually later using:"
-        log_info "/usr/local/openvpn_as/scripts/sacli --user $ADMIN_USER --new_pass '$ADMIN_PASSWORD' SetLocalPassword"
+        log_info "/usr/local/openvpn_as/scripts/sacli --user $ADMIN_USER --new_pass 'YOUR_PASSWORD' SetLocalPassword"
     fi
     
     # Configure other settings
@@ -853,7 +938,7 @@ main() {
     echo
     
     # Trap to handle script interruption
-    trap 'log_error "Script interrupted by user"; exit 1' INT TERM
+    trap 'log_warning "Script interrupted by user. Cleaning up..."; cleanup_stuck_processes; exit 1' INT TERM
     
     check_root
     detect_os
@@ -862,7 +947,16 @@ main() {
     configure_hosts_file
     install_dependencies
     generate_ssl_certificates
-    install_openvpn_as
+    
+    # Try official installation first
+    log_info "=== OPENVPN AS INSTALLATION ==="
+    if ! install_openvpn_as; then
+        log_warning "Official installation method failed, trying alternative method..."
+        if ! install_openvpn_as_manual; then
+            log_error "All installation methods failed. Please check your internet connection and try again."
+        fi
+    fi
+    
     verify_openvpn_installation
     wait_for_openvpn_ready
     configure_openvpn_as
