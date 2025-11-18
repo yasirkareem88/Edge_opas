@@ -158,7 +158,8 @@ install_upnp_tools() {
     
     if ! command -v upnpc >/dev/null 2>&1; then
         apt-get update
-        apt-get install -y miniupnpc upnp-utils
+        # Install only miniupnpc (upnp-utils doesn't exist in Ubuntu 24.04)
+        apt-get install -y miniupnpc
         
         if command -v upnpc >/dev/null 2>&1; then
             log_success "UPnP tools installed successfully"
@@ -179,10 +180,10 @@ test_upnp_connectivity() {
         install_upnp_tools
     fi
     
-    # Test UPnP discovery
-    local test_result=$(timeout 10 upnpc -l 2>/dev/null | head -10 || true)
+    # Test UPnP discovery with shorter timeout
+    local test_result=$(timeout 5 upnpc -l 2>/dev/null | head -5 || true)
     
-    if echo "$test_result" | grep -q "UPnP" || echo "$test_result" | grep -q "InternetGatewayDevice"; then
+    if echo "$test_result" | grep -q "UPnP" || echo "$test_result" | grep -q "igd" || echo "$test_result" | grep -q "InternetGatewayDevice"; then
         UPNP_AVAILABLE=true
         log_success "UPnP connectivity test: SUCCESS"
         log_info "Router supports UPnP port forwarding"
@@ -216,7 +217,6 @@ configure_upnp_advanced() {
         "$HTTPS_PORT:$HTTPS_PORT:TCP:HTTPS_Web_Interface" 
         "$OPENVPN_PORT:$OPENVPN_PORT:TCP:OpenVPN_Admin"
         "$OPENVPN_UDP_PORT:$OPENVPN_UDP_PORT:UDP:OpenVPN_VPN_Tunnel"
-        "943:943:TCP:OpenVPN_AS_Admin_Alt"
     )
     
     local success_count=0
@@ -257,7 +257,7 @@ configure_upnp_advanced() {
                 break
             else
                 log_warning "  ✗ Mapping failed (attempt $attempt/3)"
-                sleep 2
+                sleep 1
             fi
         done
         
@@ -265,7 +265,7 @@ configure_upnp_advanced() {
             log_warning "  ✗ Failed to map after 3 attempts"
         fi
         
-        echo
+        sleep 1
     done
     
     # Verify and display active mappings
@@ -292,17 +292,17 @@ configure_upnp_advanced() {
 verify_upnp_mappings() {
     log_info "Verifying active UPnP mappings..."
     
-    local active_mappings=$(upnpc -l 2>/dev/null | grep -A 20 "List of UPNP mappings:" | tail -n +2 || true)
+    local active_mappings=$(upnpc -l 2>/dev/null | grep -E "^(UDP|TCP).*->" | head -10 || true)
     
     if [ -n "$active_mappings" ]; then
         echo
         log_success "ACTIVE UPNP MAPPINGS:"
         echo "----------------------------------------"
-        echo "$active_mappings" | head -20
+        echo "$active_mappings"
         echo "----------------------------------------"
         
-        # Count successful mappings
-        local mapped_count=$(echo "$active_mappings" | grep -c "-> $SERVER_IP" || true)
+        # Count successful mappings for our server
+        local mapped_count=$(echo "$active_mappings" | grep -c "$SERVER_IP" || true)
         log_info "Confirmed mappings for this server: $mapped_count"
     else
         log_warning "No active UPnP mappings found"
@@ -448,7 +448,6 @@ install_dependencies() {
         ufw
         openssl
         miniupnpc
-        upnp-utils
     )
     
     DEBIAN_FRONTEND=noninteractive apt-get install -y "${essential_deps[@]}"
