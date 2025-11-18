@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # OpenVPN AS Installation Script for Ubuntu 24.04
-# Enhanced with ZeroTier-style NAT traversal for routers without UPnP
+# Fully automated with ZeroTier-style NAT traversal
 
 set -e  # Exit on any error
 
@@ -17,6 +17,14 @@ NC='\033[0m' # No Color
 PUBLIC_IP=""
 UPNP_AVAILABLE=false
 CONNECTION_STRATEGIES=()
+
+# Auto-configured settings
+DOMAIN_NAME="vpn.edgesrv.local"
+ADMIN_USER="admin"
+ADMIN_PASSWORD="$(openssl rand -base64 12)"
+SERVER_IP=""
+SERVER_HOSTNAME=""
+NETWORK_INTERFACE=""
 
 # Logging functions
 log_info() {
@@ -67,7 +75,7 @@ check_root() {
 
 # Detect OS and network information
 detect_os() {
-    log_info "Detecting operating system..."
+    log_info "Detecting operating system and network configuration..."
     
     if [ ! -f /etc/os-release ]; then
         log_error "Cannot detect operating system"
@@ -85,10 +93,14 @@ detect_os() {
     SERVER_HOSTNAME=$(hostname -s)
     NETWORK_INTERFACE=$(ip route | grep default | awk '{print $5}' | head -1)
     
+    # Update domain name with actual hostname
+    DOMAIN_NAME="vpn.${SERVER_HOSTNAME}.local"
+    
     log_info "Detected: $NAME $VERSION"
     log_info "Server IP: $SERVER_IP"
     log_info "Server Hostname: $SERVER_HOSTNAME"
     log_info "Network Interface: $NETWORK_INTERFACE"
+    log_info "Domain: $DOMAIN_NAME"
 }
 
 # Get public IP address
@@ -135,9 +147,28 @@ check_upnp() {
     else
         UPNP_AVAILABLE=false
         log_warning "UPnP is not available on your router"
-        log_info "This is normal for many routers. We'll use alternative connection methods."
+        log_info "Using ZeroTier-style NAT traversal alternatives"
         return 1
     fi
+}
+
+# Configure ports automatically
+configure_ports() {
+    log_info "Auto-configuring network ports..."
+    
+    # Default ports
+    SSH_PORT=22
+    HTTP_PORT=80
+    HTTPS_PORT=443
+    OPENVPN_PORT=943
+    OPENVPN_UDP_PORT=1194
+    
+    log_info "Using standard OpenVPN AS ports:"
+    echo "  SSH: $SSH_PORT/tcp"
+    echo "  HTTP: $HTTP_PORT/tcp"
+    echo "  HTTPS: $HTTPS_PORT/tcp"
+    echo "  OpenVPN Admin: $OPENVPN_PORT/tcp"
+    echo "  OpenVPN UDP: $OPENVPN_UDP_PORT/udp"
 }
 
 # ZeroTier-style NAT traversal setup
@@ -199,15 +230,6 @@ attempt_udp_punching() {
         timeout 2 bash -c "echo 'PUNCH' | nc -u -w 1 $host $test_port" >/dev/null 2>&1 &
     done
     
-    # Start background keep-alive to maintain NAT mapping
-    (
-        sleep 10
-        while true; do
-            echo "KEEPALIVE" | nc -u -w 1 127.0.0.1 9999 >/dev/null 2>&1
-            sleep 45
-        done
-    ) &
-    
     log_success "UDP hole punching initialized"
     return 0
 }
@@ -227,74 +249,12 @@ setup_tcp_fallback() {
 check_ipv6_connectivity() {
     log_info "Checking IPv6 connectivity..."
     
-    if ip -6 addr show | grep -q "inet6" && ping6 -c 1 -W 2 ipv6.google.com >/dev/null 2>&1; then
-        log_success "IPv6 connectivity available"
+    if ip -6 addr show | grep -q "inet6"; then
+        log_success "IPv6 available on interface"
         return 0
     else
-        log_info "IPv6 connectivity not available"
+        log_info "IPv6 not configured"
         return 1
-    fi
-}
-
-# Configure ports
-configure_ports() {
-    log_info "Configuring network ports..."
-    
-    # Default ports
-    SSH_PORT=22
-    HTTP_PORT=80
-    HTTPS_PORT=443
-    OPENVPN_PORT=943
-    OPENVPN_UDP_PORT=1194
-    
-    log_info "Using default ports:"
-    echo "  SSH: $SSH_PORT/tcp"
-    echo "  HTTP: $HTTP_PORT/tcp"
-    echo "  HTTPS: $HTTPS_PORT/tcp"
-    echo "  OpenVPN Admin: $OPENVPN_PORT/tcp"
-    echo "  OpenVPN UDP: $OPENVPN_UDP_PORT/udp"
-}
-
-# User input with validation
-get_user_input() {
-    log_info "OpenVPN AS Configuration"
-    echo "======================================"
-    
-    # Domain configuration
-    local default_domain="vpn.${SERVER_HOSTNAME}.local"
-    echo "Domain Configuration:"
-    read -p "Enter domain name [$default_domain]: " user_domain
-    DOMAIN_NAME=${user_domain:-$default_domain}
-    
-    # Admin credentials
-    echo
-    read -p "Enter admin username [admin]: " admin_user
-    ADMIN_USER=${admin_user:-admin}
-    
-    while true; do
-        read -s -p "Enter admin password (min 8 characters): " ADMIN_PASSWORD
-        echo
-        if [ ${#ADMIN_PASSWORD} -ge 8 ]; then
-            read -s -p "Confirm admin password: " ADMIN_PASSWORD_CONFIRM
-            echo
-            if [ "$ADMIN_PASSWORD" = "$ADMIN_PASSWORD_CONFIRM" ]; then
-                break
-            else
-                log_warning "Passwords do not match. Please try again."
-            fi
-        else
-            log_warning "Password must be at least 8 characters long."
-        fi
-    done
-    
-    # Configure ports
-    configure_ports
-    
-    echo
-    read -p "Continue with installation? (Y/n): " confirm
-    if [[ "$confirm" =~ ^[Nn]$ ]]; then
-        log_info "Installation cancelled."
-        exit 0
     fi
 }
 
@@ -353,15 +313,15 @@ configure_virtual_network() {
     
     local config_settings=(
         "host.name=$DOMAIN_NAME"
-        "cs.https.port=$OPENVPN_PORT"
+        "cs.https.port=943"
         "cs.https.ip=127.0.0.1"
         "vpn.server.port_share.service=admin+client"
-        "vpn.server.port_share.port=$HTTPS_PORT"
+        "vpn.server.port_share.port=443"
         "vpn.daemon.0.client.network=172.27.224.0"
         "vpn.daemon.0.server.ip_address=172.27.224.1"
         "vpn.daemon.0.server.netmask=255.255.252.0"
         "vpn.daemon.0.listen.ip_address=0.0.0.0"
-        "vpn.server.daemon.udp.port=$OPENVPN_UDP_PORT"
+        "vpn.server.daemon.udp.port=1194"
         "vpn.server.daemon.tcp.port=443"
         "vpn.client.routing.reroute_dns=true"
         "vpn.client.routing.reroute_gw=true"
@@ -376,7 +336,14 @@ configure_virtual_network() {
     done
     
     # Set admin password
-    safe_exec "/usr/local/openvpn_as/scripts/sacli --user '$ADMIN_USER' --new_pass '$ADMIN_PASSWORD' SetLocalPassword" "Set admin password"
+    log_info "Setting admin credentials..."
+    if /usr/local/openvpn_as/scripts/sacli --user "$ADMIN_USER" --new_pass "$ADMIN_PASSWORD" SetLocalPassword >/dev/null 2>&1; then
+        log_success "Admin password configured successfully"
+    else
+        log_warning "Failed to set admin password automatically"
+        log_info "You may need to set it manually later using:"
+        log_info "/usr/local/openvpn_as/scripts/sacli --user admin --new_pass 'your_password' SetLocalPassword"
+    fi
     
     systemctl start openvpnas 2>/dev/null || /usr/local/openvpn_as/scripts/sacli start >/dev/null 2>&1 || true
     
@@ -408,13 +375,13 @@ configure_nginx() {
     
     cat > /etc/nginx/sites-available/openvpn-as << EOF
 server {
-    listen $HTTP_PORT;
+    listen 80;
     server_name $DOMAIN_NAME;
-    return 301 https://\$server_name:\$server_port\$request_uri;
+    return 301 https://\$server_name\$request_uri;
 }
 
 server {
-    listen $HTTPS_PORT ssl;
+    listen 443 ssl;
     server_name $DOMAIN_NAME;
     
     ssl_certificate /etc/ssl/certs/ssl-cert-snakeoil.pem;
@@ -429,7 +396,7 @@ server {
     add_header X-XSS-Protection "1; mode=block";
     
     location / {
-        proxy_pass https://127.0.0.1:$OPENVPN_PORT;
+        proxy_pass https://127.0.0.1:943;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
@@ -467,17 +434,16 @@ configure_firewall() {
     echo "y" | ufw enable || true
     
     # Essential ports
-    ufw allow "$SSH_PORT/tcp" comment "SSH"
-    ufw allow "$HTTP_PORT/tcp" comment "HTTP"
-    ufw allow "$HTTPS_PORT/tcp" comment "HTTPS"
-    ufw allow "$OPENVPN_UDP_PORT/udp" comment "OpenVPN-UDP"
-    ufw allow "$OPENVPN_PORT/tcp" comment "OpenVPN-TCP"
+    ufw allow 22/tcp comment "SSH"
+    ufw allow 80/tcp comment "HTTP"
+    ufw allow 443/tcp comment "HTTPS"
+    ufw allow 1194/udp comment "OpenVPN-UDP"
+    ufw allow 943/tcp comment "OpenVPN-TCP"
     
     # Fallback ports for NAT traversal
-    ufw allow "8080/tcp" comment "OpenVPN-Fallback-1"
-    ufw allow "8443/tcp" comment "OpenVPN-Fallback-2"
-    ufw allow "8888/tcp" comment "OpenVPN-Fallback-3"
-    ufw allow "443/tcp" comment "OpenVPN-Fallback-4"
+    ufw allow 8080/tcp comment "OpenVPN-Fallback-1"
+    ufw allow 8443/tcp comment "OpenVPN-Fallback-2"
+    ufw allow 8888/tcp comment "OpenVPN-Fallback-3"
     
     echo "y" | ufw enable
     
@@ -488,7 +454,7 @@ configure_firewall() {
 wait_for_services() {
     log_info "Waiting for OpenVPN AS services to be ready..."
     
-    local max_wait=90
+    local max_wait=120
     local wait_time=0
     
     while [ $wait_time -lt $max_wait ]; do
@@ -510,40 +476,12 @@ wait_for_services() {
     log_warning "OpenVPN AS taking longer than expected to start"
     log_info "Checking service status..."
     systemctl status openvpnas --no-pager -l || true
+    
+    # Try to start manually
+    log_info "Attempting manual start..."
+    /usr/local/openvpn_as/scripts/sacli start >/dev/null 2>&1 || true
+    
     return 1
-}
-
-# Display port forwarding instructions
-show_port_forwarding_guide() {
-    echo
-    echo "=================================================="
-    echo "           MANUAL PORT FORWARDING GUIDE"
-    echo "=================================================="
-    echo
-    echo "Since UPnP is not available on your router, you need to"
-    echo "manually forward these ports to enable client connections:"
-    echo
-    echo "┌─────────────────┬──────────┬─────────────────────────────┐"
-    echo "│     Service     │   Port   │        Description          │"
-    echo "├─────────────────┼──────────┼─────────────────────────────┤"
-    echo "│ OpenVPN Clients │ $OPENVPN_UDP_PORT/UDP │ Primary client connections    │"
-    echo "│ Web Admin       │ $HTTPS_PORT/TCP   │ Administration interface     │"
-    echo "│ Admin Backup    │ $OPENVPN_PORT/TCP   │ Alternative admin access    │"
-    echo "│ Fallback 1      │ 8080/TCP   │ Client connection backup   │"
-    echo "│ Fallback 2      │ 8443/TCP   │ Client connection backup   │"
-    echo "└─────────────────┴──────────┴─────────────────────────────┘"
-    echo
-    echo "HOW TO FORWARD PORTS:"
-    echo "1. Access your router admin panel:"
-    echo "   Usually http://192.168.1.1 or http://192.168.0.1"
-    echo "2. Look for 'Port Forwarding' or 'NAT' settings"
-    echo "3. Add rules forwarding above ports to: $SERVER_IP"
-    echo "4. Save changes and restart router if required"
-    echo
-    echo "TEST CONNECTIVITY:"
-    echo "After forwarding, test from outside your network:"
-    echo "  https://$PUBLIC_IP:$HTTPS_PORT/admin"
-    echo
 }
 
 # Display installation summary
@@ -566,16 +504,16 @@ display_summary() {
     done
     echo
     echo "=== ACCESS URLs ==="
-    echo "Admin Interface:  https://$DOMAIN_NAME:$HTTPS_PORT/admin"
-    echo "Client Interface: https://$DOMAIN_NAME:$HTTPS_PORT/"
-    echo "Local Access:     https://$SERVER_IP:$HTTPS_PORT/admin"
+    echo "Admin Interface:  https://$DOMAIN_NAME/admin"
+    echo "Client Interface: https://$DOMAIN_NAME/"
+    echo "Local Access:     https://$SERVER_IP/admin"
     if [ "$PUBLIC_IP" != "Unable to detect" ]; then
-        echo "Public Access:     https://$PUBLIC_IP:$HTTPS_PORT/admin"
+        echo "Public Access:     https://$PUBLIC_IP/admin"
     fi
     echo
     echo "=== CREDENTIALS ==="
     echo "Username: $ADMIN_USER"
-    echo "Password: ********"
+    echo "Password: $ADMIN_PASSWORD"
     echo
     echo "=== NETWORK CONFIGURATION ==="
     echo "Virtual Network: 172.27.224.0/22"
@@ -604,14 +542,21 @@ display_summary() {
     
     # Show port forwarding instructions if UPnP is not available
     if [ "$UPNP_AVAILABLE" = "false" ]; then
-        show_port_forwarding_guide
+        echo "=== MANUAL PORT FORWARDING REQUIRED ==="
+        echo "Since UPnP is not available, manually forward these ports on your router:"
+        echo "  Port 1194/UDP -> $SERVER_IP (OpenVPN Client Connections)"
+        echo "  Port 443/TCP  -> $SERVER_IP (Web Administration)"
+        echo
+        echo "Router access: http://192.168.1.1 or http://192.168.0.1"
+        echo "Look for 'Port Forwarding' or 'NAT' settings"
+        echo
     fi
     
     echo "=== NEXT STEPS ==="
     echo "1. Access the admin interface to configure your VPN"
     echo "2. Create user profiles and download client configurations"
     echo "3. Configure client devices to connect to your VPN"
-    echo "4. Monitor connection logs if clients have issues"
+    echo "4. If clients cannot connect, check port forwarding on router"
     echo
 }
 
@@ -620,10 +565,13 @@ main() {
     clear
     echo "=================================================="
     echo "   OpenVPN AS + ZeroTier NAT Traversal"
-    echo "        Ubuntu 24.04 Installation"
+    echo "        Ubuntu 24.04 Automated Install"
     echo "=================================================="
     echo
+    log_info "Starting automated installation..."
+    echo
     
+    # Set trap for interruption
     trap 'log_error "Installation interrupted"; exit 1' INT TERM
     
     # Installation steps
@@ -631,7 +579,7 @@ main() {
     detect_os
     get_public_ip
     check_upnp
-    get_user_input
+    configure_ports
     configure_hosts_file
     install_dependencies
     generate_ssl_certificates
@@ -651,7 +599,7 @@ main() {
     
     if [ "$UPNP_AVAILABLE" = "false" ]; then
         log_warning "IMPORTANT: Manual port forwarding required for client connectivity"
-        log_info "Check the port forwarding guide above for instructions"
+        log_info "Forward ports 1194/UDP and 443/TCP to $SERVER_IP on your router"
     fi
 }
 
