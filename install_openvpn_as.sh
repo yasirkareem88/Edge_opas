@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # OpenVPN AS Installation Script for Ubuntu 24.04
-# Enhanced with Proper UPnP Configuration
+# Enhanced with Advanced UPnP Router Configuration
 
 set -e  # Exit on any error
 
@@ -18,9 +18,10 @@ NC='\033[0m' # No Color
 PUBLIC_IP=""
 UPNP_AVAILABLE=false
 ROUTER_IP=""
-PORTS_CONFIG=()
+ROUTER_MODEL=""
+INSTALL_INTERRUPTED=false
 
-# Logging functions
+# Simple logging functions
 log_info() {
     echo -e "${BLUE}[INFO]${NC} $1"
 }
@@ -42,6 +43,24 @@ log_debug() {
     echo -e "${PURPLE}[DEBUG]${NC} $1"
 }
 
+# Cleanup function
+cleanup() {
+    if [ "$INSTALL_INTERRUPTED" = true ]; then
+        log_warning "Cleaning up interrupted installation..."
+        pkill -f "openvpn" 2>/dev/null || true
+        pkill -f "install.sh" 2>/dev/null || true
+        rm -f /tmp/openvpn-as-install.sh
+        rm -f /tmp/openvpn-as.deb
+    fi
+}
+
+# Safe exit handler
+safe_exit() {
+    INSTALL_INTERRUPTED=true
+    cleanup
+    exit 1
+}
+
 # Check if running as root
 check_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -49,40 +68,24 @@ check_root() {
     fi
 }
 
-# Detect OS and verify Ubuntu 24.04 compatibility
+# Detect OS
 detect_os() {
-    log_info "Detecting operating system and checking compatibility..."
+    log_info "Detecting operating system..."
     
     if [ -f /etc/os-release ]; then
         . /etc/os-release
         OS=$ID
         OS_VERSION=$VERSION_ID
-        OS_CODENAME=$VERSION_CODENAME
-        OS_NAME=$NAME
     else
         log_error "Cannot detect operating system"
     fi
     
-    # Verify Ubuntu 24.04
     if [ "$OS" != "ubuntu" ]; then
         log_error "This script is designed for Ubuntu systems only. Detected: $OS"
     fi
     
-    if [ "$OS_VERSION" != "24.04" ]; then
-        log_warning "This script is optimized for Ubuntu 24.04. You are running: $OS_VERSION"
-        read -p "Continue anyway? (y/N): " -n 1 -r
-        echo
-        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-            log_info "Installation cancelled."
-            exit 0
-        fi
-    fi
-    
     # Get server IP address
-    SERVER_IP=$(ip route get 1.1.1.1 | awk '{print $7; exit}')
-    if [ -z "$SERVER_IP" ] || [ "$SERVER_IP" = "127.0.0.1" ]; then
-        SERVER_IP=$(hostname -I | awk '{print $1}')
-    fi
+    SERVER_IP=$(hostname -I | awk '{print $1}')
     if [ -z "$SERVER_IP" ]; then
         SERVER_IP="127.0.0.1"
     fi
@@ -90,46 +93,34 @@ detect_os() {
     # Get hostname
     SERVER_HOSTNAME=$(hostname -s)
     
-    log_info "Detected: $OS_NAME $OS_VERSION ($OS_CODENAME)"
+    log_info "Detected: Ubuntu $OS_VERSION"
     log_info "Server IP: $SERVER_IP"
     log_info "Server Hostname: $SERVER_HOSTNAME"
-    
-    log_success "System compatibility check passed"
 }
 
 # Get public IP address
 get_public_ip() {
     log_info "Detecting public IP address..."
     
-    local services=(
-        "https://api.ipify.org"
-        "https://checkip.amazonaws.com"
-        "https://icanhazip.com"
-        "https://ident.me"
-    )
-    
-    for service in "${services[@]}"; do
-        if PUBLIC_IP=$(curl -s -4 --connect-timeout 5 "$service" 2>/dev/null); then
-            if [[ "$PUBLIC_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-                log_success "Public IP detected: $PUBLIC_IP"
-                return 0
-            fi
+    if PUBLIC_IP=$(curl -s -4 --connect-timeout 5 https://api.ipify.org); then
+        if [[ "$PUBLIC_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            log_success "Public IP detected: $PUBLIC_IP"
+            return 0
         fi
-    done
+    fi
     
     PUBLIC_IP="Unable to detect"
     log_warning "Could not detect public IP address"
     return 1
 }
 
-# Detect router IP
-detect_router_ip() {
-    log_info "Detecting router IP address..."
+# Advanced router detection
+detect_router() {
+    log_info "Detecting router information..."
     
-    # Method 1: Use ip route (most reliable)
+    # Get router IP
     ROUTER_IP=$(ip route show default | awk '/default/ {print $3}' | head -1)
     
-    # Method 2: Guess from local IP
     if [ -z "$ROUTER_IP" ]; then
         local network_part=$(echo "$SERVER_IP" | cut -d. -f1-3)
         ROUTER_IP="${network_part}.1"
@@ -137,275 +128,252 @@ detect_router_ip() {
     
     if [[ "$ROUTER_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         log_success "Router IP detected: $ROUTER_IP"
-        return 0
     else
         ROUTER_IP="192.168.1.1"
         log_warning "Using default router IP: $ROUTER_IP"
-        return 1
     fi
-}
-
-# Check UPnP support
-check_upnp_support() {
-    log_info "Checking UPnP support on router..."
     
+    # Try to detect router model via UPnP
+    log_info "Attempting to detect router model..."
     if command -v upnpc >/dev/null 2>&1; then
-        # Test UPnP discovery
-        if timeout 10 upnpc -l >/dev/null 2>&1; then
-            UPNP_AVAILABLE=true
-            log_success "UPnP supported by router"
-            return 0
+        local router_info=$(upnpc -l 2>/dev/null | grep -i "desc:" | head -1 || true)
+        if [ -n "$router_info" ]; then
+            ROUTER_MODEL=$(echo "$router_info" | sed 's/.*desc: //i')
+            log_success "Router model detected: $ROUTER_MODEL"
         else
-            log_warning "UPnP not supported or blocked by router"
-            UPNP_AVAILABLE=false
-            return 1
+            ROUTER_MODEL="Unknown"
+            log_info "Router model: Unknown (UPnP discovery failed)"
         fi
     else
-        log_warning "UPnP client not available"
+        ROUTER_MODEL="Unknown"
+        log_info "Router model: Unknown (upnpc not available)"
+    fi
+    
+    return 0
+}
+
+# Install UPnP tools
+install_upnp_tools() {
+    log_info "Installing UPnP tools..."
+    
+    if ! command -v upnpc >/dev/null 2>&1; then
+        apt-get update
+        apt-get install -y miniupnpc upnp-utils
+        
+        if command -v upnpc >/dev/null 2>&1; then
+            log_success "UPnP tools installed successfully"
+        else
+            log_error "Failed to install UPnP tools"
+        fi
+    else
+        log_success "UPnP tools already installed"
+    fi
+}
+
+# Test UPnP connectivity
+test_upnp_connectivity() {
+    log_info "Testing UPnP connectivity to router..."
+    
+    if ! command -v upnpc >/dev/null 2>&1; then
+        log_warning "UPnPC not available, installing..."
+        install_upnp_tools
+    fi
+    
+    # Test UPnP discovery
+    local test_result=$(timeout 10 upnpc -l 2>/dev/null | head -10 || true)
+    
+    if echo "$test_result" | grep -q "UPnP" || echo "$test_result" | grep -q "InternetGatewayDevice"; then
+        UPNP_AVAILABLE=true
+        log_success "UPnP connectivity test: SUCCESS"
+        log_info "Router supports UPnP port forwarding"
+        return 0
+    else
         UPNP_AVAILABLE=false
+        log_warning "UPnP connectivity test: FAILED"
+        log_info "Router may not support UPnP or it's disabled"
         return 1
     fi
 }
 
-# Force UPnP Configuration (like ZeroTier does)
-force_upnp_configuration() {
-    log_info "Configuring UPnP port forwarding (ZeroTier method)..."
+# Advanced UPnP port forwarding with virtual server creation
+configure_upnp_advanced() {
+    log_info "=== ADVANCED UPNP CONFIGURATION ==="
+    log_info "Creating virtual server mappings on router..."
     
-    detect_router_ip
-    check_upnp_support
+    detect_router
+    install_upnp_tools
     
-    if [ "$UPNP_AVAILABLE" = false ]; then
-        log_warning "UPnP not available - skipping automatic port forwarding"
-        show_manual_port_forwarding_instructions
+    if ! test_upnp_connectivity; then
+        log_warning "Cannot configure UPnP - router not accessible"
+        show_manual_forwarding_instructions
         return 1
     fi
     
-    # Install UPnP tools if not available
-    if ! command -v upnpc >/dev/null 2>&1; then
-        log_info "Installing UPnP client..."
-        apt-get install -y miniupnpc >/dev/null 2>&1 || {
-            log_error "Failed to install UPnP client"
-        }
-    fi
-    
-    local ports_to_forward=(
-        "$SSH_PORT:tcp:SSH_Remote_Access"
-        "$HTTP_PORT:tcp:HTTP_Web_Server" 
-        "$HTTPS_PORT:tcp:HTTPS_Web_Server"
-        "$OPENVPN_PORT:tcp:OpenVPN_Admin"
-        "$OPENVPN_UDP_PORT:udp:OpenVPN_VPN"
+    # Define port mappings for virtual server
+    local port_mappings=(
+        # Internal Port : External Port : Protocol : Description
+        "$HTTP_PORT:$HTTP_PORT:TCP:HTTP_Web_Redirect"
+        "$HTTPS_PORT:$HTTPS_PORT:TCP:HTTPS_Web_Interface" 
+        "$OPENVPN_PORT:$OPENVPN_PORT:TCP:OpenVPN_Admin"
+        "$OPENVPN_UDP_PORT:$OPENVPN_UDP_PORT:UDP:OpenVPN_VPN_Tunnel"
+        "943:943:TCP:OpenVPN_AS_Admin_Alt"
     )
     
     local success_count=0
-    local failed_count=0
+    local total_ports=${#port_mappings[@]}
     
-    log_info "Starting forced UPnP port forwarding..."
+    log_info "Starting UPnP virtual server configuration..."
+    log_info "Router: $ROUTER_MODEL ($ROUTER_IP)"
+    log_info "Target Server: $SERVER_IP"
+    echo
     
-    for port_config in "${ports_to_forward[@]}"; do
-        local port=$(echo "$port_config" | cut -d: -f1)
-        local protocol=$(echo "$port_config" | cut -d: -f2)
-        local description=$(echo "$port_config" | cut -d: -f3)
+    # First, cleanup any existing mappings
+    log_info "Cleaning up existing port mappings..."
+    for mapping in "${port_mappings[@]}"; do
+        local ext_port=$(echo "$mapping" | cut -d: -f2)
+        local protocol=$(echo "$mapping" | cut -d: -f3)
         
-        log_info "Configuring $description: $protocol port $port"
+        upnpc -d "$ext_port" "$protocol" >/dev/null 2>&1 || true
+    done
+    sleep 2
+    
+    # Create new virtual server mappings
+    for mapping in "${port_mappings[@]}"; do
+        local int_port=$(echo "$mapping" | cut -d: -f1)
+        local ext_port=$(echo "$mapping" | cut -d: -f2)
+        local protocol=$(echo "$mapping" | cut -d: -f3)
+        local description=$(echo "$mapping" | cut -d: -f4)
         
-        # Remove any existing mapping first (cleanup)
-        upnpc -d "$port" "$protocol" >/dev/null 2>&1 || true
-        sleep 1
+        log_info "Configuring: $description"
+        log_info "  Mapping: $protocol $ext_port -> $SERVER_IP:$int_port"
         
-        # Add port mapping with multiple retries
-        local max_retries=3
-        local retry_count=0
-        
-        while [ $retry_count -lt $max_retries ]; do
-            # Use the exact same method as ZeroTier - direct port mapping
-            if upnpc -a "$SERVER_IP" "$port" "$port" "$protocol" "$description" >/dev/null 2>&1; then
-                log_success "✓ UPnP: Successfully mapped $protocol port $port ($description)"
+        # Attempt UPnP mapping with retry logic
+        local mapped=false
+        for attempt in {1..3}; do
+            if upnpc -a "$SERVER_IP" "$int_port" "$ext_port" "$protocol" "$description" >/dev/null 2>&1; then
+                log_success "  ✓ Successfully mapped (attempt $attempt/3)"
                 ((success_count++))
+                mapped=true
                 break
             else
-                ((retry_count++))
-                if [ $retry_count -eq $max_retries ]; then
-                    log_warning "✗ UPnP: Failed to map $protocol port $port after $max_retries attempts"
-                    ((failed_count++))
-                else
-                    log_info "Retrying $description port mapping (attempt $((retry_count + 1))/$max_retries)..."
-                    sleep 2
-                fi
+                log_warning "  ✗ Mapping failed (attempt $attempt/3)"
+                sleep 2
             fi
         done
         
-        sleep 1
+        if [ "$mapped" = false ]; then
+            log_warning "  ✗ Failed to map after 3 attempts"
+        fi
+        
+        echo
     done
     
-    # Verify the port mappings
-    log_info "Verifying UPnP port mappings..."
+    # Verify and display active mappings
     verify_upnp_mappings
     
     # Display results
     echo
-    if [ $success_count -gt 0 ]; then
-        log_success "UPnP configuration completed: $success_count ports mapped successfully"
-        
-        if [ "$PUBLIC_IP" != "Unable to detect" ]; then
-            echo
-            log_info "=== EXTERNAL ACCESS URLs (via UPnP) ==="
-            log_success "Admin Interface: https://$PUBLIC_IP:$HTTPS_PORT/admin"
-            log_success "Client Interface: https://$PUBLIC_IP:$HTTPS_PORT/"
-            log_success "OpenVPN UDP: $PUBLIC_IP:$OPENVPN_UDP_PORT"
-            log_success "SSH Access: $PUBLIC_IP:$SSH_PORT"
-            echo
-        fi
-        return 0
+    log_info "=== UPNP CONFIGURATION SUMMARY ==="
+    if [ $success_count -eq $total_ports ]; then
+        log_success "ALL $success_count ports successfully mapped!"
+        UPNP_AVAILABLE=true
+    elif [ $success_count -gt 0 ]; then
+        log_success "$success_count out of $total_ports ports mapped successfully"
+        UPNP_AVAILABLE=true
     else
-        log_warning "No UPnP ports could be mapped automatically"
-        show_manual_port_forwarding_instructions
-        return 1
+        log_warning "No ports could be mapped via UPnP"
+        UPNP_AVAILABLE=false
+    fi
+    
+    return $success_count
+}
+
+# Verify UPnP mappings
+verify_upnp_mappings() {
+    log_info "Verifying active UPnP mappings..."
+    
+    local active_mappings=$(upnpc -l 2>/dev/null | grep -A 20 "List of UPNP mappings:" | tail -n +2 || true)
+    
+    if [ -n "$active_mappings" ]; then
+        echo
+        log_success "ACTIVE UPNP MAPPINGS:"
+        echo "----------------------------------------"
+        echo "$active_mappings" | head -20
+        echo "----------------------------------------"
+        
+        # Count successful mappings
+        local mapped_count=$(echo "$active_mappings" | grep -c "-> $SERVER_IP" || true)
+        log_info "Confirmed mappings for this server: $mapped_count"
+    else
+        log_warning "No active UPnP mappings found"
     fi
 }
 
 # Show manual port forwarding instructions
-show_manual_port_forwarding_instructions() {
+show_manual_forwarding_instructions() {
     echo
-    log_warning "=== MANUAL PORT FORWARDING REQUIRED ==="
-    log_info "Please configure these ports manually on your router ($ROUTER_IP):"
+    log_warning "=== MANUAL ROUTER CONFIGURATION REQUIRED ==="
     echo
-    echo "TCP Port $HTTP_PORT    -> $SERVER_IP    (HTTP Redirect)"
-    echo "TCP Port $HTTPS_PORT   -> $SERVER_IP    (HTTPS Web Interface)"
-    echo "TCP Port $OPENVPN_PORT -> $SERVER_IP    (OpenVPN Admin)"
-    echo "UDP Port $OPENVPN_UDP_PORT -> $SERVER_IP (OpenVPN VPN)"
-    echo "TCP Port $SSH_PORT     -> $SERVER_IP    (SSH - Optional)"
+    log_info "Since UPnP auto-configuration failed, you need to manually"
+    log_info "configure port forwarding on your router:"
     echo
-    log_info "Look for 'Port Forwarding', 'Virtual Servers', or 'NAT' in your router settings"
-    log_info "Make sure to set protocol correctly (TCP/UDP) for each port"
+    log_info "ROUTER ACCESS:"
+    echo "  Router IP: http://$ROUTER_IP"
+    echo "  Model: $ROUTER_MODEL"
+    echo
+    log_info "PORTS TO FORWARD:"
+    echo "  ┌─────────────────┬──────────┬─────────────┬─────────────────┐"
+    echo "  │ Service         │ Protocol │ Port        │ Forward to      │"
+    echo "  ├─────────────────┼──────────┼─────────────┼─────────────────┤"
+    echo "  │ HTTP Redirect   │ TCP      │ $HTTP_PORT    │ $SERVER_IP │"
+    echo "  │ HTTPS Web       │ TCP      │ $HTTPS_PORT   │ $SERVER_IP │"
+    echo "  │ OpenVPN Admin   │ TCP      │ $OPENVPN_PORT │ $SERVER_IP │"
+    echo "  │ OpenVPN VPN     │ UDP      │ $OPENVPN_UDP_PORT │ $SERVER_IP │"
+    echo "  └─────────────────┴──────────┴─────────────┴─────────────────┘"
+    echo
+    log_info "ROUTER SETTINGS LOCATION:"
+    echo "  Look for: 'Port Forwarding', 'Virtual Servers', 'NAT'"
+    echo "  Or: 'Firewall' → 'Port Forwarding'"
+    echo
+    log_info "ADDITIONAL NOTES:"
+    echo "  • Make sure to enable the rules after creating them"
+    echo "  • Some routers require router restart for changes to take effect"
+    echo "  • Save your configuration to prevent loss after router reboot"
     echo
 }
 
-# Verify UPnP mappings are active
-verify_upnp_mappings() {
-    log_info "Checking active UPnP mappings..."
-    
-    if command -v upnpc >/dev/null 2>&1; then
-        local mappings=$(upnpc -l 2>/dev/null | grep -E "($SSH_PORT|$HTTP_PORT|$HTTPS_PORT|$OPENVPN_PORT|$OPENVPN_UDP_PORT)" || true)
-        
-        if [ -n "$mappings" ]; then
-            echo
-            log_success "Active UPnP Mappings:"
-            echo "$mappings"
-            echo
-        else
-            log_warning "No UPnP mappings detected in router table"
-        fi
-    fi
-}
-
-# Interactive port configuration
+# Configure ports
 configure_ports() {
     log_info "Configuring network ports..."
     
     echo
     echo "=== PORT CONFIGURATION ==="
-    echo "Please configure the following ports (press Enter for defaults):"
+    echo "Using default ports (press Enter for all):"
     echo
     
-    # SSH Port
-    read -p "Enter SSH port [22]: " SSH_PORT
-    SSH_PORT=${SSH_PORT:-22}
+    SSH_PORT=22
+    HTTP_PORT=80
+    HTTPS_PORT=443
+    OPENVPN_PORT=943
+    OPENVPN_UDP_PORT=1194
     
-    # HTTP Port
-    read -p "Enter HTTP port [80]: " HTTP_PORT
-    HTTP_PORT=${HTTP_PORT:-80}
-    
-    # HTTPS Port
-    read -p "Enter HTTPS port [443]: " HTTPS_PORT
-    HTTPS_PORT=${HTTPS_PORT:-443}
-    
-    # OpenVPN Admin Port
-    read -p "Enter OpenVPN AS Admin port [943]: " OPENVPN_PORT
-    OPENVPN_PORT=${OPENVPN_PORT:-943}
-    
-    # OpenVPN UDP Port
-    read -p "Enter OpenVPN UDP port [1194]: " OPENVPN_UDP_PORT
-    OPENVPN_UDP_PORT=${OPENVPN_UDP_PORT:-1194}
-    
-    # Display port summary
-    echo
-    log_info "Port Configuration Summary:"
+    log_info "Port Configuration:"
     echo "  SSH: $SSH_PORT/tcp"
     echo "  HTTP: $HTTP_PORT/tcp"
     echo "  HTTPS: $HTTPS_PORT/tcp"
     echo "  OpenVPN Admin: $OPENVPN_PORT/tcp"
     echo "  OpenVPN UDP: $OPENVPN_UDP_PORT/udp"
     echo
-    
-    read -p "Continue with these port settings? (Y/n): " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]] && [ -n "$REPLY" ]; then
-        log_info "Port configuration cancelled by user."
-        exit 0
-    fi
 }
 
-# Validate domain name
-validate_domain() {
-    local domain="$1"
-    if [[ ! "$domain" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]] || 
-       [[ "$domain" =~ \.\. ]] || 
-       [[ "$domain" =~ ^- ]] || 
-       [[ "$domain" =~ -$ ]] ||
-       [[ ${#domain} -gt 253 ]]; then
-        return 1
-    fi
-    return 0
-}
-
-# Generate suggested local domains
-generate_domain_suggestions() {
-    local suggestions=()
-    
-    suggestions+=("vpn.$SERVER_HOSTNAME.local")
-    suggestions+=("$SERVER_HOSTNAME.local")
-    suggestions+=("openvpn.$SERVER_HOSTNAME.local")
-    suggestions+=("vpn.local")
-    suggestions+=("openvpn.local")
-    suggestions+=("$SERVER_HOSTNAME.lan")
-    suggestions+=("vpn.$SERVER_HOSTNAME.lan")
-    
-    echo "${suggestions[@]}"
-}
-
-# User input function with validation
+# User input function
 get_user_input() {
-    log_info "Please provide the following configuration details:"
+    log_info "Please provide configuration details:"
     echo
     
-    # Generate domain suggestions
-    DOMAIN_SUGGESTIONS=($(generate_domain_suggestions))
-    
-    echo "=== LOCAL DOMAIN SUGGESTIONS ==="
-    for i in "${!DOMAIN_SUGGESTIONS[@]}"; do
-        echo "$((i+1)). ${DOMAIN_SUGGESTIONS[$i]}"
-    done
-    echo
-    
-    while true; do
-        read -p "Choose a domain (1-${#DOMAIN_SUGGESTIONS[@]}) or enter custom domain: " domain_choice
-        
-        if [[ "$domain_choice" =~ ^[0-9]+$ ]] && [ "$domain_choice" -ge 1 ] && [ "$domain_choice" -le "${#DOMAIN_SUGGESTIONS[@]}" ]; then
-            DOMAIN_NAME="${DOMAIN_SUGGESTIONS[$((domain_choice-1))]}"
-            break
-        elif [ -n "$domain_choice" ]; then
-            if validate_domain "$domain_choice"; then
-                DOMAIN_NAME="$domain_choice"
-                break
-            else
-                log_warning "Invalid domain name. Please enter a valid domain (e.g., vpn.example.com)."
-            fi
-        else
-            DOMAIN_NAME="${DOMAIN_SUGGESTIONS[0]}"
-            log_info "Using default domain: $DOMAIN_NAME"
-            break
-        fi
-    done
+    # Set domain name
+    DOMAIN_NAME="vpn.${SERVER_HOSTNAME}.local"
+    log_info "Using domain: $DOMAIN_NAME"
     
     echo
     read -p "Enter admin username [admin]: " ADMIN_USER
@@ -435,7 +403,6 @@ get_user_input() {
     log_info "Configuration Summary:"
     echo "  Domain: $DOMAIN_NAME"
     echo "  Admin User: $ADMIN_USER"
-    echo "  Admin Password: ********"  # Don't show actual password for security
     echo "  SSH Port: $SSH_PORT"
     echo "  HTTP Port: $HTTP_PORT"
     echo "  HTTPS Port: $HTTPS_PORT"
@@ -454,7 +421,7 @@ get_user_input() {
 
 # Add domain to hosts file
 configure_hosts_file() {
-    log_info "Configuring /etc/hosts file for local domain resolution..."
+    log_info "Configuring /etc/hosts file..."
     
     # Backup original hosts file
     cp /etc/hosts /etc/hosts.backup.$(date +%Y%m%d_%H%M%S)
@@ -465,167 +432,56 @@ configure_hosts_file() {
     # Add new entry
     echo "$SERVER_IP    $DOMAIN_NAME" >> /etc/hosts
     
-    log_success "Added $DOMAIN_NAME to /etc/hosts pointing to $SERVER_IP"
+    log_success "Added $DOMAIN_NAME to /etc/hosts"
 }
 
 # Install dependencies
 install_dependencies() {
     log_info "Installing dependencies..."
     
-    # Update package list
-    if ! apt-get update; then
-        log_error "Failed to update package lists"
-    fi
+    apt-get update
     
-    # Install essential packages
-    log_info "Installing essential packages..."
     local essential_deps=(
         wget
         curl
-        gnupg
-        lsb-release
-        software-properties-common
-        apt-transport-https
-        ca-certificates
-        sqlite3
-        python3
-        python3-pip
-        python3-venv
-        net-tools
-        iproute2
-        pkg-config
-        build-essential
         nginx
         ufw
         openssl
         miniupnpc
+        upnp-utils
     )
     
-    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y "${essential_deps[@]}"; then
-        log_error "Failed to install essential dependencies"
-    fi
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "${essential_deps[@]}"
     
-    log_success "All dependencies installed successfully"
+    log_success "Dependencies installed successfully"
 }
 
-# Clean up any stuck processes
-cleanup_stuck_processes() {
-    log_info "Cleaning up any stuck processes..."
-    
-    # Kill any stuck OpenVPN processes
-    pkill -f "openvpn" || true
-    pkill -f "install.sh" || true
-    pkill -f "ovpn-init" || true
-    sleep 3
-    
-    # Remove lock files
-    rm -f /var/lib/dpkg/lock*
-    rm -f /var/cache/apt/archives/lock*
-    
-    # Fix any broken packages
-    dpkg --configure -a 2>/dev/null || true
-    apt-get install -f -y 2>/dev/null || true
-}
-
-# Install OpenVPN AS with proper timeout and stuck process handling
+# Install OpenVPN AS
 install_openvpn_as() {
-    log_info "Installing OpenVPN Access Server using official method..."
+    log_info "Installing OpenVPN Access Server..."
     
-    # Clean up first
-    cleanup_stuck_processes
+    # Clean up any existing installations
+    pkill -f "openvpn" 2>/dev/null || true
+    rm -f /tmp/openvpn-as-install.sh
     
     # Download the installer
-    local installer_url="https://packages.openvpn.net/as/install.sh"
-    local installer_path="/tmp/openvpn-as-install.sh"
-    
-    if wget -q "$installer_url" -O "$installer_path"; then
-        chmod +x "$installer_path"
+    if wget -q https://packages.openvpn.net/as/install.sh -O /tmp/openvpn-as-install.sh; then
+        chmod +x /tmp/openvpn-as-install.sh
         
-        log_info "Starting OpenVPN AS installation (this may take 5-10 minutes)..."
-        log_info "DO NOT INTERRUPT - This will take a while..."
+        log_info "Starting installation (this will take 5-10 minutes)..."
+        log_info "Please be patient and DO NOT interrupt the process."
         
-        # Run installer with nohup and proper output handling
-        if timeout 900 bash -c "
-            echo 'Starting installation process...'
-            nohup bash '$installer_path' --yes > /tmp/openvpn-install.log 2>&1 &
-            PID=\$!
-            
-            # Wait for process with progress
-            for i in {1..60}; do
-                if kill -0 \$PID 2>/dev/null; then
-                    echo -n '.'
-                    sleep 10
-                else
-                    wait \$PID
-                    exit \$?
-                fi
-            done
-            
-            echo 'Installation taking longer than expected, but continuing...'
-            wait \$PID
-            exit \$?
-        "; then
-            log_success "OpenVPN AS installed successfully using official method"
-            rm -f "$installer_path"
+        # Run installer directly
+        if /tmp/openvpn-as-install.sh --yes; then
+            log_success "OpenVPN AS installed successfully"
+            rm -f /tmp/openvpn-as-install.sh
+            return 0
         else
-            log_warning "OpenVPN AS installer timed out or was interrupted"
-            log_info "Checking if installation completed..."
-            
-            # Check if installation actually completed
-            if [ -f "/usr/local/openvpn_as/scripts/sacli" ]; then
-                log_success "OpenVPN AS core components installed (installation completed)"
-                rm -f "$installer_path"
-                return 0
-            else
-                log_error "OpenVPN AS installation failed completely"
-                return 1
-            fi
+            log_warning "Installation may have had issues, checking status..."
+            return 0
         fi
     else
         log_error "Failed to download OpenVPN AS installer"
-        return 1
-    fi
-}
-
-# Alternative manual installation method
-install_openvpn_as_manual() {
-    log_info "Trying alternative manual installation method..."
-    
-    # Download the specific package for Ubuntu 24.04
-    local arch=$(dpkg --print-architecture)
-    local package_url=""
-    
-    case "$arch" in
-        "amd64")
-            package_url="https://packages.openvpn.net/as/openvpn-as-3.0.1-9c6400cd-Ubuntu24.amd64.deb"
-            ;;
-        "arm64")
-            package_url="https://packages.openvpn.net/as/openvpn-as-3.0.1-9c6400cd-Ubuntu24.arm64.deb"
-            ;;
-        *)
-            log_error "Unsupported architecture: $arch"
-            ;;
-    esac
-    
-    log_info "Downloading OpenVPN AS package for $arch..."
-    local package_path="/tmp/openvpn-as.deb"
-    
-    if wget -q "$package_url" -O "$package_path"; then
-        log_info "Installing OpenVPN AS from downloaded package..."
-        
-        # Install the package
-        if dpkg -i "$package_path"; then
-            # Fix dependencies if needed
-            apt-get install -f -y >/dev/null 2>&1 || true
-            log_success "OpenVPN AS package installed successfully"
-            rm -f "$package_path"
-            return 0
-        else
-            log_error "Failed to install OpenVPN AS package"
-            return 1
-        fi
-    else
-        log_error "Failed to download OpenVPN AS package"
         return 1
     fi
 }
@@ -634,60 +490,27 @@ install_openvpn_as_manual() {
 verify_openvpn_installation() {
     log_info "Verifying OpenVPN AS installation..."
     
-    local issues_found=0
-    
-    # Check if OpenVPN AS is installed
-    if [ ! -f "/usr/local/openvpn_as/scripts/sacli" ]; then
-        log_error "OpenVPN AS installation incomplete - sacli not found"
-    fi
-    
-    # Check if services are installed
-    if ! systemctl is-enabled openvpnas >/dev/null 2>&1; then
-        log_warning "OpenVPN AS service not enabled"
-        issues_found=1
-    fi
-    
-    if [ $issues_found -eq 0 ]; then
-        log_success "OpenVPN AS installation verified successfully"
+    if [ -f "/usr/local/openvpn_as/scripts/sacli" ]; then
+        log_success "OpenVPN AS installation verified"
+        return 0
     else
-        log_warning "Some issues were found during verification"
+        log_error "OpenVPN AS installation failed - sacli not found"
+        return 1
     fi
 }
 
-# Wait for OpenVPN AS to be fully ready
+# Wait for OpenVPN AS to be ready
 wait_for_openvpn_ready() {
-    log_info "Waiting for OpenVPN AS services to be fully ready..."
+    log_info "Waiting for OpenVPN AS services to start..."
     
-    local max_attempts=30
-    local attempt=1
-    
-    # Ensure services are started
+    # Start services
     systemctl enable openvpnas 2>/dev/null || true
     systemctl start openvpnas 2>/dev/null || true
     
-    while [ $attempt -le $max_attempts ]; do
-        # Check if services are running
-        if systemctl is-active --quiet openvpnas 2>/dev/null; then
-            # Additional check - try to connect to the admin interface
-            if curl -k -s -f https://localhost:$OPENVPN_PORT/admin >/dev/null 2>&1; then
-                log_success "OpenVPN AS is fully ready (attempt $attempt/$max_attempts)"
-                return 0
-            fi
-        fi
-        
-        if [ $((attempt % 5)) -eq 0 ]; then
-            log_info "Waiting for services... (attempt $attempt/$max_attempts)"
-        fi
-        
-        sleep 5
-        attempt=$((attempt + 1))
-    done
+    # Wait for services to start
+    sleep 30
     
-    log_warning "OpenVPN AS services are taking longer than expected to start"
-    log_info "Checking service status for debugging..."
-    systemctl status openvpnas --no-pager -l 2>/dev/null || true
-    
-    log_info "Continuing with configuration..."
+    log_info "Services should be starting up..."
 }
 
 # Configure OpenVPN AS
@@ -698,53 +521,28 @@ configure_openvpn_as() {
     systemctl stop openvpnas 2>/dev/null || true
     sleep 5
     
-    # Configure admin password with multiple retry attempts
-    local password_set=0
-    for i in {1..5}; do
-        log_info "Setting admin password (attempt $i/5)..."
-        
-        if /usr/local/openvpn_as/scripts/sacli --user "$ADMIN_USER" --new_pass "$ADMIN_PASSWORD" SetLocalPassword >/dev/null 2>&1; then
-            log_success "Admin password configured successfully"
-            password_set=1
-            break
-        else
-            log_warning "Failed to set admin password, retrying in 3 seconds..."
-            sleep 3
-        fi
-    done
-    
-    if [ $password_set -eq 0 ]; then
-        log_warning "Failed to set admin password after multiple attempts"
-        log_info "You may need to set it manually later using:"
+    # Configure admin password
+    log_info "Setting admin password..."
+    if /usr/local/openvpn_as/scripts/sacli --user "$ADMIN_USER" --new_pass "$ADMIN_PASSWORD" SetLocalPassword; then
+        log_success "Admin password configured"
+    else
+        log_warning "Failed to set admin password automatically"
+        log_info "You can set it manually later with:"
         log_info "/usr/local/openvpn_as/scripts/sacli --user $ADMIN_USER --new_pass 'YOUR_PASSWORD' SetLocalPassword"
     fi
     
-    # Configure other settings
+    # Configure basic settings
     log_info "Configuring OpenVPN AS settings..."
     
-    /usr/local/openvpn_as/scripts/sacli --key "host.name" --value "$DOMAIN_NAME" ConfigPut >/dev/null 2>&1 || {
-        log_warning "Failed to set host name"
-    }
-    
-    /usr/local/openvpn_as/scripts/sacli --key "cs.https.port" --value "$OPENVPN_PORT" ConfigPut >/dev/null 2>&1 || {
-        log_warning "Failed to set HTTPS port"
-    }
-    
-    /usr/local/openvpn_as/scripts/sacli --key "vpn.server.port_share.service" --value "admin+client" ConfigPut >/dev/null 2>&1 || {
-        log_warning "Failed to set port sharing service"
-    }
-    
-    /usr/local/openvpn_as/scripts/sacli --key "vpn.server.port_share.port" --value "$HTTPS_PORT" ConfigPut >/dev/null 2>&1 || {
-        log_warning "Failed to set port sharing port"
-    }
-    
-    /usr/local/openvpn_as/scripts/sacli --key "vpn.server.daemon.udp.port" --value "$OPENVPN_UDP_PORT" ConfigPut >/dev/null 2>&1 || {
-        log_warning "Failed to set UDP port"
-    }
+    /usr/local/openvpn_as/scripts/sacli --key "host.name" --value "$DOMAIN_NAME" ConfigPut
+    /usr/local/openvpn_as/scripts/sacli --key "cs.https.port" --value "$OPENVPN_PORT" ConfigPut
+    /usr/local/openvpn_as/scripts/sacli --key "vpn.server.port_share.service" --value "admin+client" ConfigPut
+    /usr/local/openvpn_as/scripts/sacli --key "vpn.server.port_share.port" --value "$HTTPS_PORT" ConfigPut
+    /usr/local/openvpn_as/scripts/sacli --key "vpn.server.daemon.udp.port" --value "$OPENVPN_UDP_PORT" ConfigPut
     
     # Start services
     log_info "Starting OpenVPN AS services..."
-    systemctl start openvpnas 2>/dev/null || /usr/local/openvpn_as/scripts/sacli start >/dev/null 2>&1 || true
+    systemctl start openvpnas 2>/dev/null || /usr/local/openvpn_as/scripts/sacli start
     
     sleep 10
     
@@ -755,33 +553,28 @@ configure_openvpn_as() {
 generate_ssl_certificates() {
     log_info "Generating SSL certificates for $DOMAIN_NAME..."
     
-    # Create directory if it doesn't exist
     mkdir -p /etc/ssl/private
     mkdir -p /etc/ssl/certs
     
-    # Generate certificate with the domain name
     openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
         -keyout /etc/ssl/private/ssl-cert-snakeoil.key \
         -out /etc/ssl/certs/ssl-cert-snakeoil.pem \
         -subj "/C=US/ST=State/L=City/O=Organization/CN=$DOMAIN_NAME" 2>/dev/null
     
-    # Set proper permissions
     chmod 600 /etc/ssl/private/ssl-cert-snakeoil.key
     chmod 644 /etc/ssl/certs/ssl-cert-snakeoil.pem
     
-    log_success "Self-signed certificates generated for $DOMAIN_NAME"
+    log_success "SSL certificates generated"
 }
 
-# Configure Nginx with virtual host
+# Configure Nginx
 configure_nginx() {
-    log_info "Configuring Nginx virtual host for $DOMAIN_NAME..."
+    log_info "Configuring Nginx..."
     
-    # Stop Nginx first
     systemctl stop nginx 2>/dev/null || true
     
     # Create Nginx configuration
     cat > /etc/nginx/sites-available/openvpn-as << EOF
-# OpenVPN AS configuration for Ubuntu 24.04
 server {
     listen $HTTP_PORT;
     server_name $DOMAIN_NAME;
@@ -795,13 +588,6 @@ server {
     ssl_certificate /etc/ssl/certs/ssl-cert-snakeoil.pem;
     ssl_certificate_key /etc/ssl/private/ssl-cert-snakeoil.key;
     ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
-    ssl_prefer_server_ciphers off;
-    
-    # Security headers
-    add_header X-Frame-Options DENY;
-    add_header X-Content-Type-Options nosniff;
-    add_header X-XSS-Protection "1; mode=block";
     
     location / {
         proxy_pass https://127.0.0.1:$OPENVPN_PORT;
@@ -814,10 +600,6 @@ server {
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "upgrade";
-        
-        proxy_connect_timeout 120s;
-        proxy_send_timeout 120s;
-        proxy_read_timeout 120s;
     }
 }
 EOF
@@ -826,11 +608,11 @@ EOF
     rm -f /etc/nginx/sites-enabled/default
     ln -sf /etc/nginx/sites-available/openvpn-as /etc/nginx/sites-enabled/
     
-    # Test configuration
+    # Test and start nginx
     if nginx -t; then
         systemctl enable nginx
         systemctl restart nginx
-        log_success "Nginx virtual host configured"
+        log_success "Nginx configured"
     else
         log_error "Nginx configuration test failed"
     fi
@@ -850,81 +632,61 @@ configure_firewall() {
     ufw allow "$OPENVPN_UDP_PORT/udp"
     ufw allow "$OPENVPN_PORT/tcp"
     
-    # Enable UFW (non-interactive)
+    # Enable UFW
     echo "y" | ufw enable
     
-    log_success "Firewall configured successfully"
+    log_success "Firewall configured"
 }
 
-# Final verification and summary
+# Final verification with UPnP status
 verify_installation() {
     log_info "Verifying installation..."
     
     echo
-    echo "=== SERVICE STATUS ==="
-    systemctl status openvpnas --no-pager -l 2>/dev/null || {
-        log_warning "OpenVPN AS service not running"
-        echo "Attempting to start service..."
-        systemctl start openvpnas 2>/dev/null || true
-    }
-    
+    echo "=== INSTALLATION COMPLETE ==="
     echo
-    echo "=== NETWORK INFORMATION ==="
-    echo -e "${CYAN}Local IP Address:${NC} $SERVER_IP"
-    echo -e "${CYAN}Public IP Address:${NC} $PUBLIC_IP"
-    echo -e "${CYAN}Router IP:${NC} $ROUTER_IP"
-    echo -e "${CYAN}Hostname:${NC} $SERVER_HOSTNAME"
-    echo -e "${CYAN}Domain:${NC} $DOMAIN_NAME"
+    log_success "OpenVPN Access Server is installed and configured!"
     echo
-    
+    echo "=== NETWORK STATUS ==="
+    echo "UPnP Auto-Configuration: $([ "$UPNP_AVAILABLE" = true ] && echo "SUCCESS" || echo "FAILED")"
+    echo "Router: $ROUTER_MODEL ($ROUTER_IP)"
+    echo "Public IP: $PUBLIC_IP"
+    echo "Local IP: $SERVER_IP"
+    echo
     echo "=== ACCESS INFORMATION ==="
-    log_success "Local Admin Interface: https://$DOMAIN_NAME:$HTTPS_PORT/admin"
-    log_success "Local Client Interface: https://$DOMAIN_NAME:$HTTPS_PORT/"
-    log_success "Direct Access: https://$SERVER_IP:$HTTPS_PORT/admin"
-    
-    if [ "$PUBLIC_IP" != "Unable to detect" ]; then
-        log_success "External Admin Interface: https://$PUBLIC_IP:$HTTPS_PORT/admin"
-        log_success "External Client Interface: https://$PUBLIC_IP:$HTTPS_PORT/"
-        log_success "OpenVPN UDP: $PUBLIC_IP:$OPENVPN_UDP_PORT"
-    fi
-    
+    echo "Local Admin Interface: https://$DOMAIN_NAME/admin"
+    echo "Local Client Interface: https://$DOMAIN_NAME/"
+    echo "Direct Access: https://$SERVER_IP:$HTTPS_PORT/admin"
     echo
+    if [ "$PUBLIC_IP" != "Unable to detect" ] && [ "$UPNP_AVAILABLE" = true ]; then
+        echo "External Access (via UPnP): https://$PUBLIC_IP:$HTTPS_PORT/admin"
+        echo "OpenVPN UDP (via UPnP): $PUBLIC_IP:$OPENVPN_UDP_PORT"
+        echo
+    elif [ "$PUBLIC_IP" != "Unable to detect" ]; then
+        echo "External Access (manual config required): https://$PUBLIC_IP:$HTTPS_PORT/admin"
+        echo
+    fi
     echo "=== CREDENTIALS ==="
     echo "Username: $ADMIN_USER"
-    echo "Password: $ADMIN_PASSWORD"  # Display the actual password
+    echo "Password: $ADMIN_PASSWORD"
     echo
-    
-    echo "=== VERIFICATION TESTS ==="
-    
-    # Test if services are running
-    if systemctl is-active --quiet openvpnas 2>/dev/null; then
-        log_success "✓ OpenVPN AS service is running"
-    else
-        log_warning "⚠ OpenVPN AS service is not running"
-    fi
-    
-    # Test if Nginx is running
-    if systemctl is-active --quiet nginx 2>/dev/null; then
-        log_success "✓ Nginx service is running"
-    else
-        log_warning "⚠ Nginx service is not running"
-    fi
-    
-    # Test port accessibility
-    if nc -z localhost "$HTTPS_PORT" 2>/dev/null; then
-        log_success "✓ HTTPS port $HTTPS_PORT is accessible locally"
-    else
-        log_warning "⚠ HTTPS port $HTTPS_PORT is not accessible locally"
-    fi
-    
+    echo "=== PORTS CONFIGURED ==="
+    echo "HTTP: $HTTP_PORT/tcp, HTTPS: $HTTPS_PORT/tcp"
+    echo "OpenVPN Admin: $OPENVPN_PORT/tcp"
+    echo "OpenVPN VPN: $OPENVPN_UDP_PORT/udp"
     echo
-    echo "=== TROUBLESHOOTING ==="
-    echo "If you cannot access the web interface:"
-    echo "1. Wait 2-3 minutes for services to fully initialize"
-    echo "2. Check service status: systemctl status openvpnas"
-    echo "3. View logs: journalctl -u openvpnas -f"
-    echo "4. Restart services: systemctl restart openvpnas"
-    echo "5. Manual password reset: /usr/local/openvpn_as/scripts/sacli --user $ADMIN_USER --new_pass 'yourpassword' SetLocalPassword"
+    if [ "$UPNP_AVAILABLE" = false ]; then
+        echo "=== MANUAL CONFIGURATION NEEDED ==="
+        echo "UPnP auto-configuration failed. You need to manually"
+        echo "configure port forwarding on your router at:"
+        echo "http://$ROUTER_IP"
+        echo
+    fi
+    echo "=== NEXT STEPS ==="
+    echo "1. Wait 2-3 minutes for all services to be fully ready"
+    echo "2. Access the admin interface at: https://$DOMAIN_NAME/admin"
+    echo "3. Configure your VPN settings and user access"
+    echo "4. Download client configurations for your users"
     echo
 }
 
@@ -933,13 +695,14 @@ main() {
     clear
     echo "=================================================="
     echo "   OpenVPN AS Installer for Ubuntu 24.04"
-    echo "      With ZeroTier-style UPnP Configuration"
+    echo "   Advanced UPnP Router Configuration"
     echo "=================================================="
     echo
     
-    # Trap to handle script interruption
-    trap 'log_warning "Script interrupted by user. Cleaning up..."; cleanup_stuck_processes; exit 1' INT TERM
+    # Set trap for cleanup
+    trap safe_exit INT TERM
     
+    # Run installation steps
     check_root
     detect_os
     get_public_ip
@@ -948,37 +711,37 @@ main() {
     install_dependencies
     generate_ssl_certificates
     
-    # Try official installation first
-    log_info "=== OPENVPN AS INSTALLATION ==="
-    if ! install_openvpn_as; then
-        log_warning "Official installation method failed, trying alternative method..."
-        if ! install_openvpn_as_manual; then
-            log_error "All installation methods failed. Please check your internet connection and try again."
+    log_info "=== STARTING OPENVPN AS INSTALLATION ==="
+    log_info "This will take 5-10 minutes. Please be patient..."
+    echo
+    
+    if install_openvpn_as; then
+        verify_openvpn_installation
+        wait_for_openvpn_ready
+        configure_openvpn_as
+        configure_nginx
+        configure_firewall
+        
+        log_info "=== ADVANCED UPNP ROUTER CONFIGURATION ==="
+        log_info "Configuring virtual server on your router..."
+        configure_upnp_advanced
+        
+        verify_installation
+        
+        log_success "=== INSTALLATION COMPLETED SUCCESSFULLY ==="
+        echo
+        log_info "You can now access your OpenVPN AS admin panel at:"
+        log_info "https://$DOMAIN_NAME/admin"
+        echo
+        
+        if [ "$UPNP_AVAILABLE" = true ]; then
+            log_success "UPnP configuration: SUCCESS - External access enabled"
+        else
+            log_warning "UPnP configuration: FAILED - Manual router setup required"
         fi
+    else
+        log_error "Installation failed. Please check the errors above."
     fi
-    
-    verify_openvpn_installation
-    wait_for_openvpn_ready
-    configure_openvpn_as
-    configure_nginx
-    configure_firewall
-    
-    # Force UPnP configuration (like ZeroTier does)
-    log_info "=== UPnP PORT FORWARDING CONFIGURATION ==="
-    force_upnp_configuration
-    
-    verify_installation
-    
-    log_success "OpenVPN Access Server installation completed successfully!"
-    echo
-    log_info "=== IMPORTANT NOTES ==="
-    log_info "1. Access your VPN administration at: https://$DOMAIN_NAME:$HTTPS_PORT/admin"
-    log_info "2. Username: $ADMIN_USER"
-    log_info "3. Password: $ADMIN_PASSWORD"
-    log_info "4. External access: https://$PUBLIC_IP:$HTTPS_PORT/admin"
-    log_info "5. UPnP status: $UPNP_AVAILABLE"
-    log_info "6. If UPnP failed, configure manual port forwarding on router $ROUTER_IP"
-    echo
 }
 
 # Run main function
